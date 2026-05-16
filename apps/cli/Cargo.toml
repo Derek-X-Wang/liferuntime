@@ -1,0 +1,19 @@
+[package]
+name = "liferuntime-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI entry point for the LifeRuntime."
+
+[[bin]]
+name = "liferuntime"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+liferuntime-world = { workspace = true }
+liferuntime-event-log = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "liferuntime-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic ECS-backed simulation runtime for LifeRuntime."
+
+[dependencies]
+bevy_ecs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+liferuntime-event-log = { workspace = true }

@@ -1,0 +1,19 @@
+# Example seed for a Personal World.
+# Use as a reference for what shape v1 supports today.
+
+[[projects]]
+id = "tnt"
+name = "TNT"
+tags = ["ai", "voice", "agent", "desktop"]
+
+[[goals]]
+id = "voice-agent"
+name = "Ship voice-first agent interface"
+tags = ["ai", "voice"]
+importance = 0.9
+
+[[signals]]
+source = "manual"
+summary = "Realtime voice models are improving quickly"
+tags = ["ai", "voice", "realtime"]
+confidence = 0.8

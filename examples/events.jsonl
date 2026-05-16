@@ -1,0 +1,3 @@
+{"id":"01HXEXAMPLE000000000000001","occurred_at":"2026-05-16T10:00:00Z","payload":{"kind":"ProjectCreated","id":"tnt","name":"TNT","tags":["ai","voice","agent","desktop"]}}
+{"id":"01HXEXAMPLE000000000000002","occurred_at":"2026-05-16T10:01:00Z","payload":{"kind":"GoalCreated","id":"voice-agent","name":"Ship voice-first agent interface","tags":["ai","voice"],"importance":0.9}}
+{"id":"01HXEXAMPLE000000000000003","occurred_at":"2026-05-16T10:02:00Z","payload":{"kind":"SignalObserved","source":"manual","summary":"Realtime voice models are improving quickly","tags":["ai","voice","realtime"],"confidence":0.8,"observed_at":null}}

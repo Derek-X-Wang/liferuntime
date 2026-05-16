@@ -1,0 +1,11 @@
+[package]
+name = "liferuntime-agent-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Boundary between the deterministic runtime and probabilistic AI providers."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
