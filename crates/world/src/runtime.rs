@@ -4,7 +4,7 @@ use liferuntime_event_log::{
     EventId, EventLog, EventRange, JsonlEventLog, MemoryEventLog, StoredEvent,
 };
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,11 @@ pub struct WorldRuntime {
     log: EventLogBackend,
     cursor: Cursor,
     dir: Option<PathBuf>,
+    /// Exclusive flock on `.liferuntime/lock`. Held for the lifetime of
+    /// the runtime; serializes concurrent CLI processes hitting the
+    /// same dir so cursor / events.jsonl don't race. Released on drop
+    /// (file close releases the OS lock).
+    _lock: Option<File>,
 }
 
 enum EventLogBackend {
@@ -111,10 +116,23 @@ impl WorldRuntime {
     pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+
+        // Acquire the dir-level exclusive lock BEFORE touching any
+        // other file in the dir. Blocks if another process holds it.
+        let lock_path = dir.join("lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.lock()?;
+
         let log = JsonlEventLog::open(dir.join("events.jsonl"))?;
         let cursor = load_cursor(&dir.join("cursor.json"))?;
         let mut rt = Self::with_backend(EventLogBackend::Jsonl(log), Some(dir))?;
         rt.cursor = cursor;
+        rt._lock = Some(lock_file);
         rt.replay()?;
         Ok(rt)
     }
@@ -137,6 +155,7 @@ impl WorldRuntime {
             log,
             cursor: Cursor::default(),
             dir,
+            _lock: None,
         })
     }
 
