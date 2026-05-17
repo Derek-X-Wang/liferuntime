@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
 use liferuntime_world::{Explanation, ProjectView, WorldChanges, WorldEvent, WorldRuntime};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,8 @@ use std::path::{Path, PathBuf};
     version
 )]
 struct Cli {
-    /// Directory where events.jsonl, cursor.json, and last_advance.json live.
+    /// Directory where events.jsonl, cursor.json, advances.jsonl,
+    /// last_advance.json live.
     #[arg(long, global = true, default_value = ".liferuntime")]
     dir: PathBuf,
 
@@ -59,6 +61,15 @@ enum ProjectCmd {
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
     },
+    /// Edit an existing project. Only provided fields are updated.
+    /// `--tags` replaces the project's tag list (use the full new list).
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -72,10 +83,21 @@ enum GoalCmd {
         #[arg(long, default_value_t = 0.5)]
         importance: f32,
     },
+    /// Edit an existing goal. Only provided fields are updated.
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+        #[arg(long)]
+        importance: Option<f32>,
+    },
 }
 
 #[derive(Subcommand)]
 enum SignalCmd {
+    /// Record a signal directly.
     Add {
         #[arg(long)]
         source: String,
@@ -85,6 +107,17 @@ enum SignalCmd {
         tags: Vec<String>,
         #[arg(long, default_value_t = 0.5)]
         confidence: f32,
+    },
+    /// Run an `AgentBridge` adapter (FakeAgent in v1) on free text to
+    /// generate proposed signals. The runtime does not ingest them
+    /// automatically; pass `--commit` to ingest each proposal.
+    Analyze {
+        text: String,
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Ingest the proposed events as SignalObserved after printing them.
+        #[arg(long)]
+        commit: bool,
     },
 }
 
@@ -111,6 +144,15 @@ fn main() -> Result<()> {
             })?;
             println!("Project added: {id}");
         }
+        Command::Project(ProjectCmd::Edit { id, name, tags }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::ProjectUpdated {
+                id: id.clone(),
+                name,
+                tags,
+            })?;
+            println!("Project updated: {id}");
+        }
         Command::Goal(GoalCmd::Add {
             id,
             name,
@@ -125,6 +167,21 @@ fn main() -> Result<()> {
                 importance,
             })?;
             println!("Goal added: {id}");
+        }
+        Command::Goal(GoalCmd::Edit {
+            id,
+            name,
+            tags,
+            importance,
+        }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::GoalUpdated {
+                id: id.clone(),
+                name,
+                tags,
+                importance,
+            })?;
+            println!("Goal updated: {id}");
         }
         Command::Signal(SignalCmd::Add {
             source,
@@ -141,6 +198,32 @@ fn main() -> Result<()> {
                 observed_at: None,
             })?;
             println!("Signal recorded: {summary}");
+        }
+        Command::Signal(SignalCmd::Analyze { text, tags, commit }) => {
+            let proposals = FakeAgent.analyze_signal(SignalAnalysisInput {
+                text,
+                hints: tags,
+            })?;
+            if proposals.is_empty() {
+                println!("Agent proposed no events.");
+            } else {
+                print_proposals(&proposals);
+                if commit {
+                    let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+                    for p in &proposals {
+                        rt.ingest(WorldEvent::SignalObserved {
+                            source: p.source.clone(),
+                            summary: p.summary.clone(),
+                            tags: p.tags.clone(),
+                            confidence: p.confidence,
+                            observed_at: None,
+                        })?;
+                    }
+                    println!("Committed {} signal(s) to the log.", proposals.len());
+                } else {
+                    println!("(dry run — re-run with --commit to ingest)");
+                }
+            }
         }
         Command::Advance => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
@@ -201,6 +284,19 @@ fn print_project(p: &ProjectView) {
     println!("  maintenance_burden:  {:.2}", p.maintenance_burden);
 }
 
+fn print_proposals(proposals: &[ProposedEvent]) {
+    println!("Proposed by agent:");
+    for (i, p) in proposals.iter().enumerate() {
+        println!("  [{}] {} (confidence {:.2})", i + 1, p.summary, p.confidence);
+        if !p.tags.is_empty() {
+            println!("       tags: [{}]", p.tags.join(", "));
+        }
+        if !p.rationale.is_empty() {
+            println!("       rationale: {}", p.rationale);
+        }
+    }
+}
+
 fn save_last_advance(dir: &Path, e: &Explanation) -> Result<()> {
     let path = dir.join("last_advance.json");
     let bytes = serde_json::to_vec_pretty(e)?;
@@ -218,4 +314,3 @@ fn load_last_advance(dir: &Path) -> Result<Option<Explanation>> {
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
-

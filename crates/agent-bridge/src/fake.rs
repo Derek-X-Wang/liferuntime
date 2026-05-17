@@ -1,9 +1,7 @@
 use std::convert::Infallible;
 
 use crate::proposed_event::ProposedEvent;
-use crate::provider::{
-    AgentBridge, Narrative, Scenario, ScenarioInput, SignalAnalysisInput, WorldSummaryInput,
-};
+use crate::provider::{AgentBridge, SignalAnalysisInput};
 
 /// Deterministic stub adapter — extracts a handful of tags by keyword and
 /// echoes a moderate-confidence proposed signal. Useful for tests and for
@@ -35,17 +33,6 @@ impl AgentBridge for FakeAgent {
             confidence: 0.6,
             rationale: "stub adapter: keyword-based tag extraction".into(),
         }])
-    }
-
-    fn summarize_world(&self, input: WorldSummaryInput) -> Result<Narrative, Infallible> {
-        Ok(Narrative(format!(
-            "{} recent change(s) recorded.",
-            input.recent_changes.len()
-        )))
-    }
-
-    fn propose_scenarios(&self, _input: ScenarioInput) -> Result<Vec<Scenario>, Infallible> {
-        Ok(Vec::new())
     }
 }
 

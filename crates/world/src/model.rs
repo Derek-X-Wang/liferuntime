@@ -52,3 +52,46 @@ pub struct Signal {
 /// in-memory session.
 #[derive(Component, Default)]
 pub struct Unprocessed;
+
+/// Records the last time (in event-log time) that a Project was *touched*
+/// by a relevant Signal — i.e. that the matching system found tag
+/// overlap. Used by the decay system to compute how stale the Project
+/// has become.
+#[derive(Component, Clone, Debug, Serialize, Deserialize)]
+pub struct LastTouched {
+    pub at: DateTime<Utc>,
+}
+
+/// The runtime's notion of "now" — the timestamp of the most recent
+/// Event in the log. Stored as a Bevy resource so systems can read it
+/// without touching the wall clock (ADR-0004).
+#[derive(Resource, Clone, Debug)]
+pub struct Now(pub DateTime<Utc>);
+
+impl Now {
+    pub fn at(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+impl Default for Now {
+    fn default() -> Self {
+        Self(chrono::DateTime::<Utc>::from_timestamp(0, 0).expect("epoch valid"))
+    }
+}
+
+/// The id of the most recent Event in the log. Systems that emit
+/// ChangeRecords driven by "time passing" (e.g. Decay) tag the records
+/// with this id so the cursor-based delta filter in
+/// [`crate::WorldRuntime::advance`] still works:
+///   - If `latest > cursor`, new events have arrived → decay records pass.
+///   - If `latest == cursor`, the log hasn't moved → decay records are
+///     filtered out, even if the schedule produced them again.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct LatestEventId(pub Option<liferuntime_event_log::EventId>);
+
+impl LatestEventId {
+    pub fn get(&self) -> Option<&liferuntime_event_log::EventId> {
+        self.0.as_ref()
+    }
+}

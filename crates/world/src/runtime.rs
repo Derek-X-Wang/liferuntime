@@ -1,14 +1,17 @@
 use bevy_ecs::prelude::*;
+use chrono::{DateTime, Utc};
 use liferuntime_event_log::{
     EventId, EventLog, EventRange, JsonlEventLog, MemoryEventLog, StoredEvent,
 };
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::errors::RuntimeError;
 use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
-use crate::model::{Goal, Identity, Project, Signal, Unprocessed};
+use crate::model::{Goal, Identity, LastTouched, LatestEventId, Now, Project, Signal, Unprocessed};
 use crate::queries::ProjectView;
 use crate::systems::register_systems;
 
@@ -22,12 +25,17 @@ struct Cursor {
     last_event_id: Option<EventId>,
 }
 
+/// One row in `advances.jsonl` — appended after every successful Advance.
+/// Lays the foundation for Trajectory (slope) queries: K most-recent rows
+/// describe the recent direction of a Project's fields.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdvanceRecord {
+    pub advanced_at: DateTime<Utc>,
+    pub cursor_at_advance: Option<EventId>,
+    pub records: Vec<ChangeRecord>,
+}
+
 /// The deterministic core of LifeRuntime.
-///
-/// One method per verb: `ingest` writes an event, `advance` runs systems and
-/// returns the delta, `materialize` runs systems without recording a delta
-/// (used for read-only queries that need derived state), `inspect_project`
-/// reads a projected view, `explain` renders the last-recorded changes.
 pub struct WorldRuntime {
     world: World,
     schedule: Schedule,
@@ -44,9 +52,15 @@ enum EventLogBackend {
 impl EventLogBackend {
     fn append(&mut self, payload: WorldEvent) -> Result<StoredEvent<WorldEvent>, RuntimeError> {
         let stored = StoredEvent::new(payload);
+        self.append_stored(stored)
+    }
+
+    fn append_stored(
+        &mut self,
+        stored: StoredEvent<WorldEvent>,
+    ) -> Result<StoredEvent<WorldEvent>, RuntimeError> {
         match self {
             Self::Memory(l) => {
-                // Infallible: unwrap is the unambiguous way to discard the never-typed error.
                 l.append(stored.clone()).unwrap_or_else(|never| match never {});
             }
             Self::Jsonl(l) => {
@@ -91,9 +105,6 @@ impl WorldRuntime {
         Self::with_backend(EventLogBackend::Memory(MemoryEventLog::default()), None)
     }
 
-    /// Open a runtime rooted at `dir`. Creates the directory and the
-    /// `events.jsonl` file if they do not exist, replays all persisted
-    /// events, and loads the advance cursor.
     pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -111,6 +122,8 @@ impl WorldRuntime {
     ) -> Result<Self, RuntimeError> {
         let mut world = World::new();
         world.init_resource::<ChangeLog>();
+        world.init_resource::<Now>();
+        world.init_resource::<LatestEventId>();
 
         let mut schedule = Schedule::default();
         register_systems(&mut schedule);
@@ -140,16 +153,31 @@ impl WorldRuntime {
         })
     }
 
-    /// Derive current state without recording an "advance" cursor jump. Use
-    /// from read-only commands (`inspect`) that need state to reflect all
-    /// observed signals.
+    /// Test / fixture helper: ingest an event with an explicit timestamp.
+    /// Production callers should use [`Self::ingest`].
+    pub fn ingest_at(
+        &mut self,
+        event: WorldEvent,
+        at: DateTime<Utc>,
+    ) -> Result<IngestReceipt, RuntimeError> {
+        let stored = StoredEvent {
+            id: EventId::new(),
+            occurred_at: at,
+            payload: event,
+        };
+        let stored = self.log.append_stored(stored)?;
+        apply_event(&mut self.world, &stored);
+        Ok(IngestReceipt {
+            event_id: stored.id,
+        })
+    }
+
+    /// Derive current state without recording an "advance" cursor jump.
     pub fn materialize(&mut self) -> Result<(), RuntimeError> {
         self.schedule.run(&mut self.world);
         Ok(())
     }
 
-    /// Run the schedule, emit the delta of changes triggered by events past
-    /// the last cursor, advance the cursor, persist it.
     pub fn advance(&mut self) -> Result<WorldChanges, RuntimeError> {
         self.world.resource_mut::<ChangeLog>().records.clear();
         self.schedule.run(&mut self.world);
@@ -170,6 +198,17 @@ impl WorldRuntime {
             if let Some(dir) = &self.dir {
                 save_cursor(&dir.join("cursor.json"), &self.cursor)?;
             }
+        }
+
+        if let Some(dir) = &self.dir {
+            append_advance(
+                &dir.join("advances.jsonl"),
+                &AdvanceRecord {
+                    advanced_at: Utc::now(),
+                    cursor_at_advance: self.cursor.last_event_id.clone(),
+                    records: new_records.clone(),
+                },
+            )?;
         }
 
         Ok(WorldChanges {
@@ -213,12 +252,44 @@ impl WorldRuntime {
 }
 
 fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
+    // Maintain time-tracking resources first so any system reading them
+    // sees the new event's clock position.
+    {
+        let mut now = world.resource_mut::<Now>();
+        if stored.occurred_at > now.at() {
+            *now = Now(stored.occurred_at);
+        }
+    }
+    {
+        let mut latest = world.resource_mut::<LatestEventId>();
+        if latest.get().is_none_or(|prev| stored.id > *prev) {
+            *latest = LatestEventId(Some(stored.id.clone()));
+        }
+    }
+
     match &stored.payload {
         WorldEvent::ProjectCreated { id, name, tags } => {
             world.spawn((
                 Identity(id.clone()),
                 Project::new(name.clone(), tags.clone()),
+                LastTouched {
+                    at: stored.occurred_at,
+                },
             ));
+        }
+        WorldEvent::ProjectUpdated { id, name, tags } => {
+            let mut q = world.query::<(&Identity, &mut Project)>();
+            for (ident, mut project) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    if let Some(n) = name {
+                        project.name = n.clone();
+                    }
+                    if let Some(t) = tags {
+                        project.tags = t.clone();
+                    }
+                    break;
+                }
+            }
         }
         WorldEvent::GoalCreated {
             id,
@@ -234,6 +305,28 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                     importance: *importance,
                 },
             ));
+        }
+        WorldEvent::GoalUpdated {
+            id,
+            name,
+            tags,
+            importance,
+        } => {
+            let mut q = world.query::<(&Identity, &mut Goal)>();
+            for (ident, mut goal) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    if let Some(n) = name {
+                        goal.name = n.clone();
+                    }
+                    if let Some(t) = tags {
+                        goal.tags = t.clone();
+                    }
+                    if let Some(i) = importance {
+                        goal.importance = *i;
+                    }
+                    break;
+                }
+            }
         }
         WorldEvent::SignalObserved {
             source,
@@ -271,10 +364,21 @@ fn save_cursor(path: &Path, cursor: &Cursor) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+fn append_advance(path: &Path, record: &AdvanceRecord) -> Result<(), RuntimeError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(record)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::WorldEvent;
+    use chrono::{Duration, TimeZone, Utc};
 
     fn project(id: &str, tags: &[&str]) -> WorldEvent {
         WorldEvent::ProjectCreated {
@@ -333,17 +437,18 @@ mod tests {
 
     #[test]
     fn replay_is_deterministic_for_same_inputs() {
-        let events = vec![
-            project("p1", &["ai", "voice"]),
-            signal("voice models improving", &["ai", "voice"], 0.7),
-            signal("ai funding wave", &["ai"], 0.5),
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events: Vec<(WorldEvent, _)> = vec![
+            (project("p1", &["ai", "voice"]), t0),
+            (signal("voice models improving", &["ai", "voice"], 0.7), t0 + Duration::hours(1)),
+            (signal("ai funding wave", &["ai"], 0.5), t0 + Duration::hours(2)),
         ];
 
         let mut a = WorldRuntime::in_memory().unwrap();
         let mut b = WorldRuntime::in_memory().unwrap();
-        for e in &events {
-            a.ingest(e.clone()).unwrap();
-            b.ingest(e.clone()).unwrap();
+        for (e, at) in &events {
+            a.ingest_at(e.clone(), *at).unwrap();
+            b.ingest_at(e.clone(), *at).unwrap();
         }
         let ca = a.advance().unwrap();
         let cb = b.advance().unwrap();
@@ -411,5 +516,88 @@ mod tests {
             view.strategic_relevance
         );
     }
-}
 
+    #[test]
+    fn project_edit_replays_deterministically() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut a = WorldRuntime::in_memory().unwrap();
+        let mut b = WorldRuntime::in_memory().unwrap();
+
+        for rt in [&mut a, &mut b] {
+            rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+            rt.ingest_at(
+                WorldEvent::ProjectUpdated {
+                    id: "tnt".into(),
+                    name: Some("TNT (voice agent)".into()),
+                    tags: Some(vec!["ai".into(), "voice".into()]),
+                },
+                t0 + Duration::minutes(5),
+            )
+            .unwrap();
+            rt.ingest_at(
+                signal("voice progress", &["voice"], 0.7),
+                t0 + Duration::minutes(10),
+            )
+            .unwrap();
+        }
+
+        a.materialize().unwrap();
+        b.materialize().unwrap();
+
+        let va = a.inspect_project("tnt").unwrap();
+        let vb = b.inspect_project("tnt").unwrap();
+        assert_eq!(va.name, "TNT (voice agent)");
+        assert_eq!(va.tags, vec!["ai", "voice"]);
+        assert!((va.strategic_relevance - vb.strategic_relevance).abs() < 1e-6);
+    }
+
+    #[test]
+    fn decay_pulls_strategic_relevance_back_toward_baseline_over_event_time() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        runtime
+            .ingest_at(project("p1", &["ai", "voice"]), t0)
+            .unwrap();
+        runtime
+            .ingest_at(
+                signal("strong voice signal", &["ai", "voice"], 1.0),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        let first = runtime.advance().unwrap();
+        let rel_after_match = first
+            .records
+            .iter()
+            .find(|r| r.entity_id == "p1" && r.field == "strategic_relevance")
+            .map(|r| r.after)
+            .expect("match should produce a strategic_relevance change");
+        assert!(rel_after_match > 0.5);
+
+        // 30 event-log days pass with an unrelated signal landing at t0+30d.
+        runtime
+            .ingest_at(
+                signal("political news", &["politics"], 0.5),
+                t0 + Duration::days(30),
+            )
+            .unwrap();
+        let second = runtime.advance().unwrap();
+
+        let decay = second
+            .records
+            .iter()
+            .find(|r| r.entity_id == "p1" && r.field == "strategic_relevance")
+            .expect("decay should produce a strategic_relevance change");
+        assert!(
+            decay.after < decay.before,
+            "expected decay to pull value down: before={}, after={}",
+            decay.before,
+            decay.after
+        );
+        assert!(
+            decay.after > 0.5,
+            "decay should approach 0.5 baseline asymptotically, not undershoot: {}",
+            decay.after
+        );
+    }
+}

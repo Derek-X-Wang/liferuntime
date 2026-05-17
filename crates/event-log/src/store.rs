@@ -1,18 +1,31 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fmt;
 
 /// Stable, lexicographically-sortable identifier for an event.
 ///
-/// Backed by a ULID so identifiers are monotonic over time and comparable
-/// as strings without parsing.
+/// Backed by a ULID. We use [`ulid::Generator`] (thread-local) instead of
+/// the default `Ulid::new()` so two ids minted in the same millisecond are
+/// guaranteed monotonic — otherwise the cursor-based delta filter in
+/// `WorldRuntime::advance` can drop derived records when their triggering
+/// event id sorts before the cursor by accident.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EventId(pub String);
 
+thread_local! {
+    static GENERATOR: RefCell<ulid::Generator> = const { RefCell::new(ulid::Generator::new()) };
+}
+
 impl EventId {
     pub fn new() -> Self {
-        Self(ulid::Ulid::new().to_string())
+        let ulid = GENERATOR.with(|g| {
+            g.borrow_mut()
+                .generate()
+                .expect("ulid generator should not overflow within one millisecond")
+        });
+        Self(ulid.to_string())
     }
 
     pub fn as_str(&self) -> &str {

@@ -31,6 +31,12 @@ pub enum Cause {
         matched_tags: Vec<String>,
         confidence: f32,
     },
+    /// Time-based drift back toward baseline because no recent Signal
+    /// matched this Project. `days_elapsed` is in event-log days, not
+    /// wall-clock (ADR-0004).
+    Decay {
+        days_elapsed: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +107,10 @@ fn render_cause(c: &Cause) -> String {
             signal_summary,
             matched_tags.join(", "),
             confidence,
+        ),
+        Cause::Decay { days_elapsed } => format!(
+            "Decay: {:.1} days since last relevant signal",
+            days_elapsed,
         ),
     }
 }

@@ -17,3 +17,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 liferuntime-world = { workspace = true }
 liferuntime-event-log = { workspace = true }
+liferuntime-agent-bridge = { workspace = true }
