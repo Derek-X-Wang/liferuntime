@@ -23,6 +23,17 @@ change the matching algorithm, replay of old Events will produce new
 Changes that reflect the new algorithm; the Event log itself does not
 change.
 
+### Idempotency key
+
+Events optionally carry an `idempotency_key` (envelope metadata, not
+part of the payload). A second ingest with the same key is a no-op:
+the second call returns the original event's id and the log is not
+appended.
+
+Designed for cron / script retries — `liferuntime signal add
+--idempotency-key cron-2026-05-17` ingested twice produces one event.
+Without a key, ingest is always additive.
+
 ## Advance
 
 A *reporting* operation, not a trigger. `WorldRuntime::advance` reads

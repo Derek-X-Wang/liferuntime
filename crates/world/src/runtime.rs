@@ -4,6 +4,7 @@ use liferuntime_event_log::{
     EventId, EventLog, EventRange, JsonlEventLog, MemoryEventLog, StoredEvent,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,10 @@ pub struct WorldRuntime {
     /// same dir so cursor / events.jsonl don't race. Released on drop
     /// (file close releases the OS lock).
     _lock: Option<File>,
+    /// Idempotency keys we have already accepted (rebuilt from the log
+    /// on `open_dir`). A second ingest with the same key returns the
+    /// existing event id and does nothing else.
+    seen_keys: HashMap<String, EventId>,
 }
 
 enum EventLogBackend {
@@ -156,19 +161,49 @@ impl WorldRuntime {
             cursor: Cursor::default(),
             dir,
             _lock: None,
+            seen_keys: HashMap::new(),
         })
     }
 
     fn replay(&mut self) -> Result<(), RuntimeError> {
         let events = self.log.replay_all()?;
         for stored in events {
+            if let Some(key) = &stored.idempotency_key {
+                self.seen_keys.insert(key.clone(), stored.id.clone());
+            }
             self.apply_and_derive(&stored);
         }
         Ok(())
     }
 
     pub fn ingest(&mut self, event: WorldEvent) -> Result<IngestReceipt, RuntimeError> {
-        let stored = self.log.append(event)?;
+        self.ingest_with_key(event, None)
+    }
+
+    /// Ingest an event with an optional idempotency key. A second
+    /// ingest carrying the same key (within the same log) is a no-op
+    /// that returns the original event's id.
+    pub fn ingest_with_key(
+        &mut self,
+        event: WorldEvent,
+        key: Option<String>,
+    ) -> Result<IngestReceipt, RuntimeError> {
+        if let Some(k) = &key {
+            if let Some(existing) = self.seen_keys.get(k) {
+                return Ok(IngestReceipt {
+                    event_id: existing.clone(),
+                });
+            }
+        }
+        let stored = match key.clone() {
+            Some(k) => self
+                .log
+                .append_stored(StoredEvent::with_idempotency_key(event, k))?,
+            None => self.log.append(event)?,
+        };
+        if let Some(k) = key {
+            self.seen_keys.insert(k, stored.id.clone());
+        }
         self.apply_and_derive(&stored);
         Ok(IngestReceipt {
             event_id: stored.id,
@@ -185,6 +220,7 @@ impl WorldRuntime {
         let stored = StoredEvent {
             id: EventId::new(),
             occurred_at: at,
+            idempotency_key: None,
             payload: event,
         };
         let stored = self.log.append_stored(stored)?;
@@ -846,6 +882,67 @@ mod tests {
             .flat_map(|r| r.causes.iter())
             .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
         assert!(rendered, "amplified change should carry a GoalAmplified cause");
+    }
+
+    #[test]
+    fn idempotency_key_dedupes_repeated_ingest() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+
+        let s = signal("ai news", &["ai"], 0.8);
+        let first = rt
+            .ingest_with_key(s.clone(), Some("cron-2026-05-17".into()))
+            .unwrap();
+        let second = rt
+            .ingest_with_key(s.clone(), Some("cron-2026-05-17".into()))
+            .unwrap();
+
+        assert_eq!(
+            first.event_id, second.event_id,
+            "second ingest with same key should return the original event id"
+        );
+
+        // Bump should only have happened once.
+        let changes = rt.advance().unwrap();
+        let bumps: Vec<_> = changes
+            .records
+            .iter()
+            .filter(|r| r.entity_id == "tnt" && r.field == "strategic_relevance")
+            .collect();
+        assert_eq!(
+            bumps.len(),
+            1,
+            "expected exactly one strategic_relevance bump, got {bumps:#?}"
+        );
+    }
+
+    #[test]
+    fn idempotency_keys_persist_across_open_dir() {
+        let dir = tempfile_dir();
+
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(project("tnt", &["ai"])).unwrap();
+            rt.ingest_with_key(
+                signal("ai news", &["ai"], 0.6),
+                Some("kron-job-42".into()),
+            )
+            .unwrap();
+        }
+
+        // Second "CLI invocation" with the same key should be a no-op.
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let before_advance = rt.event_count();
+        rt.ingest_with_key(
+            signal("ai news", &["ai"], 0.6),
+            Some("kron-job-42".into()),
+        )
+        .unwrap();
+        let after_advance = rt.event_count();
+        assert_eq!(
+            before_advance, after_advance,
+            "ingest with seen key should not append to log"
+        );
     }
 
     #[test]

@@ -61,6 +61,9 @@ enum Command {
         /// Override the pulse timestamp. Defaults to wall-clock now.
         #[arg(long)]
         at: Option<DateTime<Utc>>,
+        /// Optional idempotency key. Useful for cron retries.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
     },
 }
 
@@ -151,6 +154,10 @@ enum SignalCmd {
         tags: Vec<String>,
         #[arg(long, default_value_t = 0.5)]
         confidence: f32,
+        /// Optional idempotency key. A second `signal add` with the
+        /// same key is a no-op — useful for cron retries.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
     },
     /// Run an `AgentBridge` adapter (FakeAgent in v1) on free text to
     /// generate proposed signals. The runtime does not ingest them
@@ -162,6 +169,11 @@ enum SignalCmd {
         /// Ingest the proposed events as SignalObserved after printing them.
         #[arg(long)]
         commit: bool,
+        /// Optional idempotency-key *prefix*. Each proposed event gets
+        /// `{prefix}#{n}` as its key, so a second run with the same
+        /// prefix dedupes against the first.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
     },
 }
 
@@ -274,18 +286,27 @@ fn main() -> Result<()> {
             summary,
             tags,
             confidence,
+            idempotency_key,
         }) => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
-            rt.ingest(WorldEvent::SignalObserved {
-                source,
-                summary: summary.clone(),
-                tags,
-                confidence,
-                observed_at: None,
-            })?;
+            rt.ingest_with_key(
+                WorldEvent::SignalObserved {
+                    source,
+                    summary: summary.clone(),
+                    tags,
+                    confidence,
+                    observed_at: None,
+                },
+                idempotency_key,
+            )?;
             println!("Signal recorded: {summary}");
         }
-        Command::Signal(SignalCmd::Analyze { text, tags, commit }) => {
+        Command::Signal(SignalCmd::Analyze {
+            text,
+            tags,
+            commit,
+            idempotency_key,
+        }) => {
             let proposals = FakeAgent.analyze_signal(SignalAnalysisInput {
                 text,
                 hints: tags,
@@ -296,14 +317,20 @@ fn main() -> Result<()> {
                 print_proposals(&proposals);
                 if commit {
                     let mut rt = WorldRuntime::open_dir(&cli.dir)?;
-                    for p in &proposals {
-                        rt.ingest(WorldEvent::SignalObserved {
-                            source: p.source.clone(),
-                            summary: p.summary.clone(),
-                            tags: p.tags.clone(),
-                            confidence: p.confidence,
-                            observed_at: None,
-                        })?;
+                    for (n, p) in proposals.iter().enumerate() {
+                        let key = idempotency_key
+                            .as_ref()
+                            .map(|prefix| format!("{prefix}#{}", n + 1));
+                        rt.ingest_with_key(
+                            WorldEvent::SignalObserved {
+                                source: p.source.clone(),
+                                summary: p.summary.clone(),
+                                tags: p.tags.clone(),
+                                confidence: p.confidence,
+                                observed_at: None,
+                            },
+                            key,
+                        )?;
                     }
                     println!("Committed {} signal(s) to the log.", proposals.len());
                 } else {
@@ -333,10 +360,16 @@ fn main() -> Result<()> {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
             println!("Replayed {} events from {}.", rt.event_count(), cli.dir.display());
         }
-        Command::Pulse { at } => {
+        Command::Pulse {
+            at,
+            idempotency_key,
+        } => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
             let observed_at = at.unwrap_or_else(Utc::now);
-            rt.ingest(WorldEvent::TimePulseObserved { observed_at })?;
+            rt.ingest_with_key(
+                WorldEvent::TimePulseObserved { observed_at },
+                idempotency_key,
+            )?;
             println!("Pulse recorded at {observed_at}");
         }
     }

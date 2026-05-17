@@ -45,11 +45,19 @@ impl Default for EventId {
     }
 }
 
-/// A payload wrapped with provenance — id and timestamp — for storage.
+/// A payload wrapped with provenance — id, timestamp, and an optional
+/// idempotency key — for storage.
+///
+/// `idempotency_key` is None for events ingested without a key (e.g.,
+/// interactive CLI use). When present, the runtime uses it to dedupe
+/// retries: a second ingest with the same key is a no-op and returns
+/// the existing event id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredEvent<T> {
     pub id: EventId,
     pub occurred_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub payload: T,
 }
 
@@ -58,6 +66,16 @@ impl<T> StoredEvent<T> {
         Self {
             id: EventId::new(),
             occurred_at: Utc::now(),
+            idempotency_key: None,
+            payload,
+        }
+    }
+
+    pub fn with_idempotency_key(payload: T, key: String) -> Self {
+        Self {
+            id: EventId::new(),
+            occurred_at: Utc::now(),
+            idempotency_key: Some(key),
             payload,
         }
     }
