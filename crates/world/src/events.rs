@@ -53,6 +53,30 @@ pub enum WorldEvent {
         #[serde(default)]
         observed_at: Option<DateTime<Utc>>,
     },
+    /// Soft-shelve a project. Systems skip it; inspect still works.
+    /// Reversible via [`WorldEvent::ProjectReactivated`].
+    ProjectArchived {
+        id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Mark a project done. Systems skip it; inspect still works.
+    /// Reversible via [`WorldEvent::ProjectReactivated`].
+    ProjectCompleted {
+        id: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    ProjectReactivated {
+        id: String,
+    },
+    /// A first-class no-op event whose only effect is to advance
+    /// event-log time. Lets [`Decay`](../docs/CONTEXT.md#decay) fire
+    /// during quiet stretches (vacation, low signal activity) without
+    /// breaking replay determinism. Ingested via `liferuntime pulse`.
+    TimePulseObserved {
+        observed_at: DateTime<Utc>,
+    },
 }
 
 fn default_importance() -> f32 {

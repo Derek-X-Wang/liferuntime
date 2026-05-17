@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
-use liferuntime_world::{Explanation, ProjectView, WorldChanges, WorldEvent, WorldRuntime};
+use liferuntime_world::{
+    Explanation, ProjectStatus, ProjectView, WorldChanges, WorldEvent, WorldRuntime,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -50,6 +53,15 @@ enum Command {
 
     /// Print the number of stored events (proof of replay).
     Replay,
+
+    /// Advance event-log time without an underlying world event. Used
+    /// during quiet stretches (vacation, low activity) so Decay can catch
+    /// up. Replay-safe — the pulse is itself a logged Event.
+    Pulse {
+        /// Override the pulse timestamp. Defaults to wall-clock now.
+        #[arg(long)]
+        at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -69,6 +81,22 @@ enum ProjectCmd {
         name: Option<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+    },
+    /// Soft-shelve a project. Systems skip it; reactivate to un-do.
+    Archive {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Mark a project done. Systems skip it; reactivate to un-do.
+    Complete {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Move an Archived or Completed project back to Active.
+    Reactivate {
+        id: String,
     },
 }
 
@@ -152,6 +180,27 @@ fn main() -> Result<()> {
                 tags,
             })?;
             println!("Project updated: {id}");
+        }
+        Command::Project(ProjectCmd::Archive { id, reason }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::ProjectArchived {
+                id: id.clone(),
+                reason,
+            })?;
+            println!("Project archived: {id}");
+        }
+        Command::Project(ProjectCmd::Complete { id, note }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::ProjectCompleted {
+                id: id.clone(),
+                note,
+            })?;
+            println!("Project completed: {id}");
+        }
+        Command::Project(ProjectCmd::Reactivate { id }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::ProjectReactivated { id: id.clone() })?;
+            println!("Project reactivated: {id}");
         }
         Command::Goal(GoalCmd::Add {
             id,
@@ -246,6 +295,12 @@ fn main() -> Result<()> {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
             println!("Replayed {} events from {}.", rt.event_count(), cli.dir.display());
         }
+        Command::Pulse { at } => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            let observed_at = at.unwrap_or_else(Utc::now);
+            rt.ingest(WorldEvent::TimePulseObserved { observed_at })?;
+            println!("Pulse recorded at {observed_at}");
+        }
     }
     Ok(())
 }
@@ -276,12 +331,21 @@ fn print_advance(dir: &Path, changes: &WorldChanges) -> Result<()> {
 }
 
 fn print_project(p: &ProjectView) {
-    println!("Project: {} ({})", p.name, p.id);
+    let status_label = match p.status {
+        ProjectStatus::Active => "active".to_string(),
+        ProjectStatus::Archived => match &p.archived_reason {
+            Some(r) => format!("archived ({r})"),
+            None => "archived".into(),
+        },
+        ProjectStatus::Completed => match &p.completion_note {
+            Some(n) => format!("completed ({n})"),
+            None => "completed".into(),
+        },
+    };
+    println!("Project: {} ({}) [{}]", p.name, p.id, status_label);
     println!("Tags: [{}]", p.tags.join(", "));
     println!("  strategic_relevance: {:.2}", p.strategic_relevance);
     println!("  urgency:             {:.2}", p.urgency);
-    println!("  momentum:            {:.2}", p.momentum);
-    println!("  maintenance_burden:  {:.2}", p.maintenance_burden);
 }
 
 fn print_proposals(proposals: &[ProposedEvent]) {

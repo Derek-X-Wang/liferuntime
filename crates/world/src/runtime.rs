@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use crate::errors::RuntimeError;
 use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
-use crate::model::{Goal, Identity, LastTouched, LatestEventId, Now, Project, Signal, Unprocessed};
+use crate::model::{
+    Goal, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal, Unprocessed,
+};
 use crate::queries::ProjectView;
 use crate::systems::register_systems;
 
@@ -226,8 +228,9 @@ impl WorldRuntime {
                     tags: project.tags.clone(),
                     strategic_relevance: project.strategic_relevance,
                     urgency: project.urgency,
-                    momentum: project.momentum,
-                    maintenance_burden: project.maintenance_burden,
+                    status: project.status,
+                    archived_reason: project.archived_reason.clone(),
+                    completion_note: project.completion_note.clone(),
                 });
             }
         }
@@ -346,6 +349,45 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 },
                 Unprocessed,
             ));
+        }
+        WorldEvent::ProjectArchived { id, reason } => {
+            let mut q = world.query::<(&Identity, &mut Project)>();
+            for (ident, mut project) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    project.status = ProjectStatus::Archived;
+                    project.archived_reason = reason.clone();
+                    project.closed_at = Some(stored.occurred_at);
+                    break;
+                }
+            }
+        }
+        WorldEvent::ProjectCompleted { id, note } => {
+            let mut q = world.query::<(&Identity, &mut Project)>();
+            for (ident, mut project) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    project.status = ProjectStatus::Completed;
+                    project.completion_note = note.clone();
+                    project.closed_at = Some(stored.occurred_at);
+                    break;
+                }
+            }
+        }
+        WorldEvent::ProjectReactivated { id } => {
+            let mut q = world.query::<(&Identity, &mut Project)>();
+            for (ident, mut project) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    project.status = ProjectStatus::Active;
+                    project.archived_reason = None;
+                    project.completion_note = None;
+                    project.closed_at = None;
+                    break;
+                }
+            }
+        }
+        WorldEvent::TimePulseObserved { .. } => {
+            // No entity to spawn. The Now / LatestEventId resource
+            // updates above already advanced event-log time, which is
+            // the pulse's entire purpose.
         }
     }
 }
@@ -549,6 +591,244 @@ mod tests {
         assert_eq!(va.name, "TNT (voice agent)");
         assert_eq!(va.tags, vec!["ai", "voice"]);
         assert!((va.strategic_relevance - vb.strategic_relevance).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cli_style_disk_roundtrip_archive_after_signal_preserves_relevance() {
+        let dir = tempfile_dir();
+
+        // First "CLI invocation": create the world.
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(project("tnt", &["ai", "voice"])).unwrap();
+            rt.ingest(WorldEvent::GoalCreated {
+                id: "g1".into(),
+                name: "Voice agent".into(),
+                tags: vec!["ai".into(), "voice".into()],
+                importance: 1.0,
+            })
+            .unwrap();
+            rt.ingest(signal("voice progress", &["ai", "voice"], 0.6))
+                .unwrap();
+        }
+
+        // Sleep a few millis so the archive's occurred_at is strictly
+        // greater than the signal's.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Second "CLI invocation": archive.
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(WorldEvent::ProjectArchived {
+                id: "tnt".into(),
+                reason: Some("shipped".into()),
+            })
+            .unwrap();
+        }
+
+        // Third "CLI invocation": inspect. Should still show the
+        // pre-archival match's effect on relevance.
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        rt.materialize().unwrap();
+        let view = rt.inspect_project("tnt").expect("project exists");
+        assert_eq!(view.status, ProjectStatus::Archived);
+        assert!(
+            view.strategic_relevance > 0.5,
+            "signal arrived before archive — relevance should be > 0.5, got {}",
+            view.strategic_relevance
+        );
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "liferuntime-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        base.join(unique)
+    }
+
+    #[test]
+    fn signals_arriving_before_archive_still_count_after_replay() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        runtime
+            .ingest_at(project("p1", &["ai", "voice"]), t0)
+            .unwrap();
+        runtime
+            .ingest_at(
+                signal("voice progress", &["ai", "voice"], 0.6),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        runtime
+            .ingest_at(
+                WorldEvent::ProjectArchived {
+                    id: "p1".into(),
+                    reason: Some("shipped".into()),
+                },
+                t0 + Duration::minutes(2),
+            )
+            .unwrap();
+
+        // Don't advance — just materialize. Matching should run for the
+        // signal because it arrived before the archive.
+        runtime.materialize().unwrap();
+
+        let view = runtime.inspect_project("p1").expect("project exists");
+        assert_eq!(view.status, ProjectStatus::Archived);
+        assert!(
+            view.strategic_relevance > 0.5,
+            "signal that arrived before archive should still have bumped relevance, got {}",
+            view.strategic_relevance
+        );
+    }
+
+    #[test]
+    fn archived_projects_are_skipped_by_matching_and_decay() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        runtime
+            .ingest_at(project("p1", &["ai", "voice"]), t0)
+            .unwrap();
+        runtime
+            .ingest_at(
+                WorldEvent::ProjectArchived {
+                    id: "p1".into(),
+                    reason: Some("paused".into()),
+                },
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        runtime
+            .ingest_at(
+                signal("voice models improving", &["ai", "voice"], 1.0),
+                t0 + Duration::minutes(2),
+            )
+            .unwrap();
+        // Days later, a pulse advances time → decay would normally fire.
+        runtime
+            .ingest_at(
+                WorldEvent::TimePulseObserved {
+                    observed_at: t0 + Duration::days(30),
+                },
+                t0 + Duration::days(30),
+            )
+            .unwrap();
+
+        let changes = runtime.advance().unwrap();
+        assert!(
+            !changes.contains_change_for("p1"),
+            "archived project should not change: {:?}",
+            changes.records
+        );
+
+        let view = runtime.inspect_project("p1").expect("project exists");
+        assert_eq!(view.status, ProjectStatus::Archived);
+        assert_eq!(view.archived_reason.as_deref(), Some("paused"));
+        assert!(
+            (view.strategic_relevance - 0.5).abs() < 1e-6,
+            "archived project should remain at default 0.5, got {}",
+            view.strategic_relevance
+        );
+    }
+
+    #[test]
+    fn goal_amplifies_signal_matching() {
+        let mut runtime_no_goal = WorldRuntime::in_memory().unwrap();
+        runtime_no_goal
+            .ingest(project("tnt", &["ai", "voice"]))
+            .unwrap();
+        runtime_no_goal
+            .ingest(signal("voice progress", &["voice", "ai"], 0.6))
+            .unwrap();
+        let base = runtime_no_goal.advance().unwrap();
+        let base_delta = base
+            .records
+            .iter()
+            .find(|r| r.entity_id == "tnt" && r.field == "strategic_relevance")
+            .map(|r| r.after - r.before)
+            .expect("base run should have a relevance delta");
+
+        let mut runtime_with_goal = WorldRuntime::in_memory().unwrap();
+        runtime_with_goal
+            .ingest(project("tnt", &["ai", "voice"]))
+            .unwrap();
+        runtime_with_goal
+            .ingest(WorldEvent::GoalCreated {
+                id: "voice-agent".into(),
+                name: "Ship voice-first agent".into(),
+                tags: vec!["ai".into(), "voice".into()],
+                importance: 1.0,
+            })
+            .unwrap();
+        runtime_with_goal
+            .ingest(signal("voice progress", &["voice", "ai"], 0.6))
+            .unwrap();
+        let amped = runtime_with_goal.advance().unwrap();
+        let amped_delta = amped
+            .records
+            .iter()
+            .find(|r| r.entity_id == "tnt" && r.field == "strategic_relevance")
+            .map(|r| r.after - r.before)
+            .expect("amplified run should have a relevance delta");
+
+        let ratio = amped_delta / base_delta;
+        assert!(
+            (ratio - 1.5).abs() < 1e-4,
+            "max-importance goal should amplify by 1.5×, got {ratio} (amped={amped_delta}, base={base_delta})"
+        );
+
+        let rendered = amped
+            .records
+            .iter()
+            .flat_map(|r| r.causes.iter())
+            .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
+        assert!(rendered, "amplified change should carry a GoalAmplified cause");
+    }
+
+    #[test]
+    fn time_pulse_advances_event_log_time_and_fires_decay() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        runtime
+            .ingest_at(project("p1", &["ai"]), t0)
+            .unwrap();
+        runtime
+            .ingest_at(
+                signal("strong ai signal", &["ai"], 1.0),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        runtime.advance().unwrap();
+
+        // No real-world events, but a pulse moves time forward 14 days.
+        runtime
+            .ingest_at(
+                WorldEvent::TimePulseObserved {
+                    observed_at: t0 + Duration::days(14),
+                },
+                t0 + Duration::days(14),
+            )
+            .unwrap();
+        let changes = runtime.advance().unwrap();
+
+        let decay = changes
+            .records
+            .iter()
+            .find(|r| r.entity_id == "p1" && r.field == "strategic_relevance")
+            .expect("pulse-driven decay should produce a record");
+        assert!(
+            decay.after < decay.before,
+            "pulse should pull strategic_relevance toward baseline"
+        );
     }
 
     #[test]

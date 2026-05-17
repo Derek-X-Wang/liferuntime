@@ -13,6 +13,6 @@ mod jsonl;
 mod memory;
 mod store;
 
-pub use jsonl::{JsonlError, JsonlEventLog};
+pub use jsonl::{JsonlError, JsonlEventLog, SCHEMA_VERSION};
 pub use memory::MemoryEventLog;
 pub use store::{EventId, EventLog, EventRange, StoredEvent};

@@ -20,6 +20,8 @@ pub mod systems;
 pub use errors::RuntimeError;
 pub use events::WorldEvent;
 pub use explanation::{Cause, ChangeRecord, ExplainTarget, Explanation};
-pub use model::{Goal, Identity, LastTouched, LatestEventId, Now, Project, Signal};
+pub use model::{
+    Goal, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
+};
 pub use queries::{GoalView, ProjectView};
 pub use runtime::{IngestReceipt, WorldChanges, WorldRuntime};

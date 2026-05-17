@@ -37,6 +37,15 @@ pub enum Cause {
     Decay {
         days_elapsed: f32,
     },
+    /// A high-importance Goal in the same tag-neighborhood amplified the
+    /// signal's effect on this Project. `factor` is the multiplier
+    /// applied (e.g. 1.45 means a 45% boost over the base delta).
+    GoalAmplified {
+        goal_id: String,
+        goal_name: String,
+        importance: f32,
+        factor: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +120,15 @@ fn render_cause(c: &Cause) -> String {
         Cause::Decay { days_elapsed } => format!(
             "Decay: {:.1} days since last relevant signal",
             days_elapsed,
+        ),
+        Cause::GoalAmplified {
+            goal_name,
+            importance,
+            factor,
+            ..
+        } => format!(
+            "Goal \"{}\" (importance {:.2}) amplified by ×{:.2}",
+            goal_name, importance, factor,
         ),
     }
 }

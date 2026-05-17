@@ -13,8 +13,17 @@ pub struct Project {
     pub tags: Vec<String>,
     pub strategic_relevance: f32,
     pub urgency: f32,
-    pub momentum: f32,
-    pub maintenance_burden: f32,
+    pub status: ProjectStatus,
+    #[serde(default)]
+    pub archived_reason: Option<String>,
+    #[serde(default)]
+    pub completion_note: Option<String>,
+    /// Event-log timestamp at which the project transitioned out of
+    /// [`ProjectStatus::Active`]. Used by the matching system to keep
+    /// signals that arrived *before* archival valid — otherwise replay
+    /// would lose all prior signal effects on archived projects.
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
 }
 
 impl Project {
@@ -23,11 +32,35 @@ impl Project {
             name: name.into(),
             tags,
             strategic_relevance: 0.5,
-            urgency: 0.4,
-            momentum: 0.4,
-            maintenance_burden: 0.3,
+            urgency: 0.5,
+            status: ProjectStatus::Active,
+            archived_reason: None,
+            completion_note: None,
+            closed_at: None,
         }
     }
+
+    /// True if a signal observed at `signal_time` should still affect
+    /// this project — either the project is Active, or the signal
+    /// predates the project's closure.
+    pub fn accepts_signal_at(&self, signal_time: DateTime<Utc>) -> bool {
+        if self.status == ProjectStatus::Active {
+            return true;
+        }
+        match self.closed_at {
+            Some(closed) => signal_time < closed,
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    #[default]
+    Active,
+    Archived,
+    Completed,
 }
 
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]

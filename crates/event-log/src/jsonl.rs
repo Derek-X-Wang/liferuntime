@@ -1,9 +1,18 @@
 use super::store::{EventId, EventLog, EventRange, StoredEvent};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Schema version of the on-disk JSONL log written by this binary.
+///
+/// Bumped only when a breaking change to `WorldEvent` (rename, remove, or
+/// payload reshape) lands. Adding new variants does not require a bump.
+/// See ADR-0005 for the compatibility contract.
+pub const SCHEMA_VERSION: u32 = 1;
+
+const SCHEMA_MARKER: &str = "liferuntime-schema";
 
 #[derive(Debug, Error)]
 pub enum JsonlError {
@@ -19,15 +28,25 @@ pub enum JsonlError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("event log schema version {found} is newer than this binary's expected version {expected} — upgrade liferuntime or run `liferuntime migrate`")]
+    SchemaTooNew { found: u32, expected: u32 },
 }
 
 /// File-backed append-only event log.
 ///
-/// One JSON object per line. Files are opened in append mode for writes; the
-/// in-memory cache is the canonical replay source within the process.
+/// One JSON object per line. The first line is a metadata header
+/// recording the schema version; subsequent lines are events. Old logs
+/// (pre-header) are treated as version 1.
 pub struct JsonlEventLog<T> {
     path: PathBuf,
     cache: Vec<StoredEvent<T>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SchemaHeader {
+    #[serde(rename = "_meta")]
+    meta: String,
+    version: u32,
 }
 
 impl<T> JsonlEventLog<T>
@@ -42,12 +61,21 @@ where
                 source,
             })?;
         }
+
+        let was_empty = !path.exists() || file_is_empty(&path)?;
         if !path.exists() {
             File::create(&path).map_err(|source| JsonlError::Io {
                 path: path.clone(),
                 source,
             })?;
         }
+
+        if was_empty {
+            // Fresh log: write the schema header so future readers know
+            // exactly what produced it.
+            write_header(&path)?;
+        }
+
         let file = File::open(&path).map_err(|source| JsonlError::Io {
             path: path.clone(),
             source,
@@ -61,6 +89,24 @@ where
             if raw.trim().is_empty() {
                 continue;
             }
+            // The first non-empty line may be a schema header. If so,
+            // validate and skip; if not, this is a pre-header log
+            // (implicitly version 1).
+            if idx == 0 {
+                if let Ok(header) = serde_json::from_str::<SchemaHeader>(&raw) {
+                    if header.meta == SCHEMA_MARKER {
+                        if header.version > SCHEMA_VERSION {
+                            return Err(JsonlError::SchemaTooNew {
+                                found: header.version,
+                                expected: SCHEMA_VERSION,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                // First line isn't a header → fall through, treat as
+                // a normal event in a pre-header log.
+            }
             let event: StoredEvent<T> =
                 serde_json::from_str(&raw).map_err(|source| JsonlError::Json {
                     line: idx + 1,
@@ -70,6 +116,37 @@ where
         }
         Ok(Self { path, cache })
     }
+}
+
+fn file_is_empty(path: &Path) -> Result<bool, JsonlError> {
+    let meta = std::fs::metadata(path).map_err(|source| JsonlError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(meta.len() == 0)
+}
+
+fn write_header(path: &Path) -> Result<(), JsonlError> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|source| JsonlError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let header = SchemaHeader {
+        meta: SCHEMA_MARKER.into(),
+        version: SCHEMA_VERSION,
+    };
+    let line = serde_json::to_string(&header).map_err(|source| JsonlError::Json {
+        line: 1,
+        source,
+    })?;
+    writeln!(file, "{line}").map_err(|source| JsonlError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
 }
 
 impl<T> EventLog<T> for JsonlEventLog<T>
@@ -87,7 +164,7 @@ where
                 source,
             })?;
         let line = serde_json::to_string(&event).map_err(|source| JsonlError::Json {
-            line: self.cache.len() + 1,
+            line: self.cache.len() + 2, // +1 for header, +1 for next line
             source,
         })?;
         writeln!(file, "{line}").map_err(|source| JsonlError::Io {

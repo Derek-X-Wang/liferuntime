@@ -745,6 +745,7 @@ name = "liferuntime-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "liferuntime-agent-bridge",
  "liferuntime-event-log",

@@ -56,6 +56,25 @@ Wall-clock time is allowed only at the moment of ingest, to stamp a new
 Event's `occurred_at`. After that, the wall clock is invisible to the
 runtime.
 
+## TimePulse
+
+A first-class Event whose only effect is to advance event-log time.
+Used during quiet stretches (vacation, low signal activity) to let
+Decay catch up to wall-clock reality without violating replay
+determinism. Surfaced as `WorldEvent::TimePulseObserved { observed_at }`
+and ingested via `liferuntime pulse [--at TIMESTAMP]`.
+
+The runtime never injects pulses on its own. The user (or a user-side
+cron) chooses when time passes:
+
+```
+# crontab: nudge the runtime forward at 9am daily
+0 9 * * *  liferuntime --dir ~/.liferuntime pulse
+```
+
+Pulses are in the log alongside real Events, so replay reproduces them
+identically. The world only moves when the user decides it does.
+
 ## Decay
 
 The DOWN-force on Project fields. Without a matching Signal, a
@@ -96,12 +115,49 @@ Goal, InvestmentPosition, Commitment, Risk, Opportunity, etc.
 
 A long-running creative, technical, personal, or business effort the user
 may invest time, money, and attention into. Has tags, strategic_relevance,
-urgency, momentum, maintenance_burden.
+urgency, momentum, maintenance_burden, and a **status**.
+
+### ProjectStatus
+
+A Project moves through three states:
+
+- **Active** (default) — the project participates in matching, decay,
+  attention prompts, and recommendations.
+- **Archived** — soft-shelved. Systems skip it. Inspectable. Can be
+  reactivated. Surfaced via `liferuntime project archive <id>
+  [--reason ...]`.
+- **Completed** — done. Systems skip it. Inspectable as historical
+  record. Surfaced via `liferuntime project complete <id>
+  [--note ...]`.
+
+Status transitions are Events (`ProjectArchived`, `ProjectCompleted`,
+`ProjectReactivated`), not direct field edits. This preserves the
+"event log is canonical" property: replay of the same events always
+yields the same set of Active projects.
+
+Hard deletion is intentionally not supported. Past ChangeRecords keep
+referencing the project; archival keeps explanations readable forever.
+
+*Not yet implemented; deferred to the next session alongside status /
+trajectory.*
 
 ## Goal
 
 A desired future state used to evaluate whether World changes are aligned
-or misaligned. Has importance and tags.
+or misaligned. Has `importance` (0.0 – 1.0) and tags.
+
+Goals are load-bearing in v1: when a Signal arrives whose tags overlap a
+Goal's tags, that Goal's `importance` *amplifies* the Resonance applied
+to matching Projects. Concretely:
+
+```
+relevance_delta *= 1 + 0.5 * max(importance of goals whose tags overlap signal tags)
+```
+
+A high-importance Goal in the user's strategic neighborhood makes signals
+in that neighborhood hit harder. The amplifying Goal is recorded as a
+[Cause](#cause) on the resulting ChangeRecord, so explanations cite the
+goal by name.
 
 ## Constraint
 
