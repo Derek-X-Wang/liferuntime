@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
 use liferuntime_world::{
-    Explanation, ProjectStatus, ProjectView, WorldChanges, WorldEvent, WorldRuntime,
+    Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView, WorldChanges, WorldEvent,
+    WorldRuntime,
 };
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,15 @@ enum Command {
 
     /// Print the number of stored events (proof of replay).
     Replay,
+
+    /// Surface what's pulling on attention: active projects ranked by
+    /// current strategic_relevance with their recent Trajectory
+    /// (↑ warming / ↓ cooling / → stable).
+    Status {
+        /// Number of recent Advances to compute Trajectory slope over.
+        #[arg(long, default_value_t = 5)]
+        window: usize,
+    },
 
     /// Advance event-log time without an underlying world event. Used
     /// during quiet stretches (vacation, low activity) so Decay can catch
@@ -360,6 +370,11 @@ fn main() -> Result<()> {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
             println!("Replayed {} events from {}.", rt.event_count(), cli.dir.display());
         }
+        Command::Status { window } => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            let trajectories = rt.trajectories(window)?;
+            print_status(&trajectories, window);
+        }
         Command::Pulse {
             at,
             idempotency_key,
@@ -417,6 +432,51 @@ fn print_project(p: &ProjectView) {
     println!("Tags: [{}]", p.tags.join(", "));
     println!("  strategic_relevance: {:.2}", p.strategic_relevance);
     println!("  urgency:             {:.2}", p.urgency);
+}
+
+fn print_status(views: &[ProjectTrajectoryView], window: usize) {
+    let mut active: Vec<&ProjectTrajectoryView> = views
+        .iter()
+        .filter(|v| v.status == ProjectStatus::Active)
+        .collect();
+    active.sort_by(|a, b| {
+        b.current_relevance
+            .partial_cmp(&a.current_relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if active.is_empty() {
+        println!("No active projects. Add one with `liferuntime project add`.");
+        return;
+    }
+
+    println!("Active projects ({}, trajectory over last {} advance(s)):", active.len(), window);
+    for v in &active {
+        let arrow = if v.advances_observed == 0 {
+            "·"
+        } else if v.slope_relevance > 0.02 {
+            "↑"
+        } else if v.slope_relevance < -0.02 {
+            "↓"
+        } else {
+            "→"
+        };
+        let label = match arrow {
+            "↑" => "warming",
+            "↓" => "cooling",
+            "→" => "stable",
+            _ => "quiet",
+        };
+        println!(
+            "  {} {:24}  relevance {:.2}  urgency {:.2}  slope {:+.3} ({})",
+            arrow,
+            v.name,
+            v.current_relevance,
+            v.current_urgency,
+            v.slope_relevance,
+            label,
+        );
+    }
 }
 
 fn print_proposals(proposals: &[ProposedEvent]) {

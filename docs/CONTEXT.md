@@ -228,18 +228,29 @@ implementation when they ship.
 
 ## Trajectory
 
-The current *direction* of a field on an Entity — the signed average
-delta across the last K Advances. A Project whose `strategic_relevance`
-averaged `+0.04` per advance over the last 5 advances has a positive
-Trajectory; a project whose values are oscillating around a mean has a
-Trajectory near zero.
+The current *direction* of a field on an Entity. Computed as the net
+change in that field during the **most recent Advance** (within a
+configurable look-back window of N Advances) that produced any record
+for the Entity.
+
+A Project that just absorbed a sharp signal has a positive Trajectory
+("warming"). One that just took a decay step toward baseline has a
+negative Trajectory ("cooling"). One that hasn't been touched in the
+window has Trajectory zero ("quiet").
+
+The most-recent-delta semantic (rather than a window-wide average) is
+deliberate: a bump followed by a decay should surface as cooling, not
+average out to zero. For "what's happening now", the latest data point
+beats the trailing window.
 
 Trajectory is not a time series and not a forecast. The history of a
 field's values over the event log is called **History**, surfaced via
 replay-to-each-event. A predicted future curve is called **Forecast**,
 not yet built. Do not overload "Trajectory" to mean any of those.
 
-*Not yet implemented; the term is reserved.*
+Surfaced via `liferuntime status` (sorts active projects by current
+relevance, annotates each with ↑/↓/→ from Trajectory) and the
+programmatic `WorldRuntime::trajectories(window)` API.
 
 ## Recommendation
 

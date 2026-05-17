@@ -23,5 +23,5 @@ pub use explanation::{Cause, ChangeRecord, ExplainTarget, Explanation};
 pub use model::{
     Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
 };
-pub use queries::{GoalView, ProjectView};
+pub use queries::{GoalView, ProjectTrajectoryView, ProjectView};
 pub use runtime::{IngestReceipt, WorldChanges, WorldRuntime};

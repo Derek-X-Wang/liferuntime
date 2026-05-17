@@ -6,7 +6,7 @@ use liferuntime_event_log::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::errors::RuntimeError;
@@ -16,7 +16,7 @@ use crate::model::{
     Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
     Unprocessed,
 };
-use crate::queries::ProjectView;
+use crate::queries::{ProjectTrajectoryView, ProjectView};
 use crate::systems::register_systems;
 
 /// Persistent cursor for "what has the user already advanced through".
@@ -312,15 +312,95 @@ impl WorldRuntime {
     pub fn event_count(&self) -> usize {
         self.log.replay_all().map(|v| v.len()).unwrap_or(0)
     }
+
+    /// Read the last `window` rows of `advances.jsonl` and compute, for
+    /// each Project, the average per-advance change in
+    /// `strategic_relevance`. Use this as the Trajectory slope.
+    ///
+    /// Projects with no recorded change in the window get a 0.0 slope
+    /// and `advances_observed: 0`. Useful for `liferuntime status`.
+    pub fn trajectories(
+        &mut self,
+        window: usize,
+    ) -> Result<Vec<ProjectTrajectoryView>, RuntimeError> {
+        let advances = self.recent_advances(window)?;
+
+        // For each entity: how many advances in the window touched it,
+        // and what was the net delta in the most recent of those.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut last_delta: HashMap<String, f32> = HashMap::new();
+        for adv in &advances {
+            let mut per_entity_this_advance: HashMap<String, f32> = HashMap::new();
+            for r in &adv.records {
+                if r.field == "strategic_relevance" {
+                    *per_entity_this_advance.entry(r.entity_id.clone()).or_insert(0.0) +=
+                        r.after - r.before;
+                }
+            }
+            for (entity, delta) in per_entity_this_advance {
+                *counts.entry(entity.clone()).or_insert(0) += 1;
+                // Iteration is oldest → newest, so overwriting yields the latest.
+                last_delta.insert(entity, delta);
+            }
+        }
+
+        let mut q = self.world.query::<(&Identity, &Project)>();
+        let mut out: Vec<ProjectTrajectoryView> = Vec::new();
+        for (ident, project) in q.iter(&self.world) {
+            let slope = last_delta.get(&ident.0).copied().unwrap_or(0.0);
+            let count = counts.get(&ident.0).copied().unwrap_or(0);
+            out.push(ProjectTrajectoryView {
+                id: ident.0.clone(),
+                name: project.name.clone(),
+                status: project.status,
+                current_relevance: project.strategic_relevance,
+                current_urgency: project.urgency,
+                slope_relevance: slope,
+                advances_observed: count,
+            });
+        }
+        Ok(out)
+    }
+
+    fn recent_advances(&self, window: usize) -> Result<Vec<AdvanceRecord>, RuntimeError> {
+        let Some(dir) = &self.dir else {
+            return Ok(Vec::new());
+        };
+        let path = dir.join("advances.jsonl");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path)?;
+        let mut all: Vec<AdvanceRecord> = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec: AdvanceRecord = serde_json::from_str(&line)?;
+            all.push(rec);
+        }
+        let total = all.len();
+        Ok(all.into_iter().skip(total.saturating_sub(window)).collect())
+    }
 }
 
 fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
     // Maintain time-tracking resources first so any system reading them
     // sees the new event's clock position.
+    //
+    // TimePulseObserved is special: its *payload* observed_at is the
+    // intended clock position (often "fast-forward N days"), while the
+    // envelope occurred_at is just ingest wall-clock. Use the payload
+    // for pulses so decay actually catches up.
+    let effective_now = match &stored.payload {
+        WorldEvent::TimePulseObserved { observed_at } => *observed_at,
+        _ => stored.occurred_at,
+    };
     {
         let mut now = world.resource_mut::<Now>();
-        if stored.occurred_at > now.at() {
-            *now = Now(stored.occurred_at);
+        if effective_now > now.at() {
+            *now = Now(effective_now);
         }
     }
     {
@@ -882,6 +962,32 @@ mod tests {
             .flat_map(|r| r.causes.iter())
             .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
         assert!(rendered, "amplified change should carry a GoalAmplified cause");
+    }
+
+    #[test]
+    fn trajectories_show_most_recent_delta_not_window_average() {
+        let dir = tempfile_dir();
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest_at(project("hot", &["ai"]), Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()).unwrap();
+            rt.ingest_at(signal("ai news", &["ai"], 1.0), Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap()).unwrap();
+            rt.advance().unwrap(); // first advance: bump
+            rt.ingest_at(
+                WorldEvent::TimePulseObserved { observed_at: Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap() },
+                Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
+            ).unwrap();
+            rt.advance().unwrap(); // second advance: decay
+        }
+
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let trajectories = rt.trajectories(5).unwrap();
+        let hot = trajectories.iter().find(|t| t.id == "hot").expect("project visible");
+        // Most recent advance was the decay; slope should be negative.
+        assert!(
+            hot.slope_relevance < 0.0,
+            "expected cooling slope, got {} (window-average would be ~zero)",
+            hot.slope_relevance
+        );
     }
 
     #[test]
