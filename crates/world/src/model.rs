@@ -48,6 +48,43 @@ pub struct Goal {
     pub name: String,
     pub tags: Vec<String>,
     pub importance: f32,
+    #[serde(default)]
+    pub status: GoalStatus,
+    #[serde(default)]
+    pub achievement_note: Option<String>,
+    #[serde(default)]
+    pub abandonment_reason: Option<String>,
+}
+
+impl Goal {
+    pub fn new(name: impl Into<String>, tags: Vec<String>, importance: f32) -> Self {
+        Self {
+            name: name.into(),
+            tags,
+            importance,
+            status: GoalStatus::Active,
+            achievement_note: None,
+            abandonment_reason: None,
+        }
+    }
+}
+
+/// Goals have a value-charged lifecycle distinct from Projects:
+/// - **Active** — the goal still pulls on strategy; amplifies matching.
+/// - **Achieved** — the goal was reached. Historical record.
+/// - **Abandoned** — the goal was given up. Historical record.
+///
+/// Both terminal states stop the goal's amplification of matching.
+/// Reactivation moves it back to Active. The achieved/abandoned
+/// distinction matters for future systems (recommendations after a win
+/// look different from recommendations after a loss).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    #[default]
+    Active,
+    Achieved,
+    Abandoned,
 }
 
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]

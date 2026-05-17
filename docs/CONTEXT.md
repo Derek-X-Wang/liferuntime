@@ -143,20 +143,40 @@ trajectory.*
 ## Goal
 
 A desired future state used to evaluate whether World changes are aligned
-or misaligned. Has `importance` (0.0 – 1.0) and tags.
+or misaligned. Has `importance` (0.0 – 1.0), tags, and a **status**.
 
-Goals are load-bearing in v1: when a Signal arrives whose tags overlap a
-Goal's tags, that Goal's `importance` *amplifies* the Resonance applied
-to matching Projects. Concretely:
+Goals are load-bearing in v1: when a Signal arrives whose tags overlap an
+*Active* Goal's tags, that Goal's `importance` *amplifies* the Resonance
+applied to matching Projects. Concretely:
 
 ```
-relevance_delta *= 1 + 0.5 * max(importance of goals whose tags overlap signal tags)
+relevance_delta *= 1 + 0.5 * max(importance of active goals whose tags overlap signal tags)
 ```
 
 A high-importance Goal in the user's strategic neighborhood makes signals
 in that neighborhood hit harder. The amplifying Goal is recorded as a
 [Cause](#cause) on the resulting ChangeRecord, so explanations cite the
 goal by name.
+
+### GoalStatus
+
+A Goal moves through three states:
+
+- **Active** (default) — the goal pulls on strategy; amplifies matching.
+- **Achieved** — the goal was reached. Historical record. Surfaced via
+  `liferuntime goal achieve <id> [--note ...]`. Stops amplifying.
+- **Abandoned** — the goal was given up. Historical record. Surfaced via
+  `liferuntime goal abandon <id> [--reason ...]`. Stops amplifying.
+
+Both terminal states are reversible via `liferuntime goal reactivate
+<id>`. The Achieved / Abandoned distinction matters for future systems:
+recommendations after a win look different from recommendations after a
+loss.
+
+Goals are intentionally symmetric with [Project](#project)'s lifecycle —
+but use value-charged verbs (Achieved / Abandoned) instead of neutral
+ones (Completed / Archived) because Goals have an evaluative dimension
+Projects don't.
 
 ## Constraint
 

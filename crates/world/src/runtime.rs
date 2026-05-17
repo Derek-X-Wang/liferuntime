@@ -12,7 +12,8 @@ use crate::errors::RuntimeError;
 use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
 use crate::model::{
-    Goal, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal, Unprocessed,
+    Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
+    Unprocessed,
 };
 use crate::queries::ProjectView;
 use crate::systems::register_systems;
@@ -306,11 +307,7 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
         } => {
             world.spawn((
                 Identity(id.clone()),
-                Goal {
-                    name: name.clone(),
-                    tags: tags.clone(),
-                    importance: *importance,
-                },
+                Goal::new(name.clone(), tags.clone(), *importance),
             ));
         }
         WorldEvent::GoalUpdated {
@@ -389,6 +386,37 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
             // No entity to spawn. The Now / LatestEventId resource
             // updates above already advanced event-log time, which is
             // the pulse's entire purpose.
+        }
+        WorldEvent::GoalAchieved { id, note } => {
+            let mut q = world.query::<(&Identity, &mut Goal)>();
+            for (ident, mut goal) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    goal.status = GoalStatus::Achieved;
+                    goal.achievement_note = note.clone();
+                    break;
+                }
+            }
+        }
+        WorldEvent::GoalAbandoned { id, reason } => {
+            let mut q = world.query::<(&Identity, &mut Goal)>();
+            for (ident, mut goal) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    goal.status = GoalStatus::Abandoned;
+                    goal.abandonment_reason = reason.clone();
+                    break;
+                }
+            }
+        }
+        WorldEvent::GoalReactivated { id } => {
+            let mut q = world.query::<(&Identity, &mut Goal)>();
+            for (ident, mut goal) in q.iter_mut(world) {
+                if ident.0 == *id {
+                    goal.status = GoalStatus::Active;
+                    goal.achievement_note = None;
+                    goal.abandonment_reason = None;
+                    break;
+                }
+            }
         }
     }
 }
@@ -799,6 +827,57 @@ mod tests {
             .flat_map(|r| r.causes.iter())
             .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
         assert!(rendered, "amplified change should carry a GoalAmplified cause");
+    }
+
+    #[test]
+    fn achieved_goal_no_longer_amplifies_matching() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        runtime
+            .ingest(project("tnt", &["ai", "voice"]))
+            .unwrap();
+        runtime
+            .ingest(WorldEvent::GoalCreated {
+                id: "g1".into(),
+                name: "Ship voice agent".into(),
+                tags: vec!["ai".into(), "voice".into()],
+                importance: 1.0,
+            })
+            .unwrap();
+        runtime
+            .ingest(signal("voice progress", &["voice", "ai"], 0.6))
+            .unwrap();
+        let first = runtime.advance().unwrap();
+        let amped_delta = first
+            .records
+            .iter()
+            .find(|r| r.entity_id == "tnt" && r.field == "strategic_relevance")
+            .map(|r| r.after - r.before)
+            .expect("amplified bump exists");
+
+        // Achieve the goal; subsequent signal should NOT be amplified.
+        runtime
+            .ingest(WorldEvent::GoalAchieved {
+                id: "g1".into(),
+                note: Some("shipped v1".into()),
+            })
+            .unwrap();
+        runtime
+            .ingest(signal("more voice news", &["voice", "ai"], 0.6))
+            .unwrap();
+        let second = runtime.advance().unwrap();
+        let unamped_delta = second
+            .records
+            .iter()
+            .find(|r| r.entity_id == "tnt" && r.field == "strategic_relevance")
+            .map(|r| r.after - r.before)
+            .expect("post-achievement bump exists");
+
+        // Ratio of amped : unamped should be ~1.5.
+        let ratio = amped_delta / unamped_delta;
+        assert!(
+            (ratio - 1.5).abs() < 1e-3,
+            "achieved goal should no longer amplify (ratio expected ~1.5, got {ratio})"
+        );
     }
 
     #[test]

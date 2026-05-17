@@ -2,7 +2,8 @@ use bevy_ecs::prelude::*;
 
 use crate::explanation::{Cause, ChangeLog, ChangeRecord};
 use crate::model::{
-    Goal, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal, Unprocessed,
+    Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
+    Unprocessed,
 };
 
 pub fn register_systems(schedule: &mut Schedule) {
@@ -117,6 +118,11 @@ fn goal_amplifier(
 ) -> (f32, Option<Cause>) {
     let mut best: Option<(&Identity, &Goal)> = None;
     for (id, goal) in goals {
+        // Only Active goals amplify. Achieved / Abandoned goals are
+        // historical records and don't pull on current strategy.
+        if goal.status != GoalStatus::Active {
+            continue;
+        }
         let overlap = goal.tags.iter().any(|gt| {
             signal_tags
                 .iter()

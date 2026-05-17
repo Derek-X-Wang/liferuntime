@@ -77,6 +77,22 @@ pub enum WorldEvent {
     TimePulseObserved {
         observed_at: DateTime<Utc>,
     },
+    /// Mark a goal as reached. Removes it from matching amplification.
+    GoalAchieved {
+        id: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Mark a goal as given up. Removes it from matching amplification.
+    GoalAbandoned {
+        id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Move an Achieved or Abandoned goal back to Active.
+    GoalReactivated {
+        id: String,
+    },
 }
 
 fn default_importance() -> f32 {

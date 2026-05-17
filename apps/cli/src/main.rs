@@ -121,6 +121,22 @@ enum GoalCmd {
         #[arg(long)]
         importance: Option<f32>,
     },
+    /// Mark a goal as reached. Stops amplifying matching.
+    Achieve {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Mark a goal as given up. Stops amplifying matching.
+    Abandon {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Move an Achieved or Abandoned goal back to Active.
+    Reactivate {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -231,6 +247,27 @@ fn main() -> Result<()> {
                 importance,
             })?;
             println!("Goal updated: {id}");
+        }
+        Command::Goal(GoalCmd::Achieve { id, note }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::GoalAchieved {
+                id: id.clone(),
+                note,
+            })?;
+            println!("Goal achieved: {id}");
+        }
+        Command::Goal(GoalCmd::Abandon { id, reason }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::GoalAbandoned {
+                id: id.clone(),
+                reason,
+            })?;
+            println!("Goal abandoned: {id}");
+        }
+        Command::Goal(GoalCmd::Reactivate { id }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::GoalReactivated { id: id.clone() })?;
+            println!("Goal reactivated: {id}");
         }
         Command::Signal(SignalCmd::Add {
             source,
