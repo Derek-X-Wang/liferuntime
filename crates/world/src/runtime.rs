@@ -188,6 +188,7 @@ impl WorldRuntime {
         event: WorldEvent,
         key: Option<String>,
     ) -> Result<IngestReceipt, RuntimeError> {
+        self.validate_event(&event)?;
         if let Some(k) = &key {
             if let Some(existing) = self.seen_keys.get(k) {
                 return Ok(IngestReceipt {
@@ -208,6 +209,90 @@ impl WorldRuntime {
         Ok(IngestReceipt {
             event_id: stored.id,
         })
+    }
+
+    /// Reject events that would violate runtime invariants: duplicate
+    /// entity creation, edits / lifecycle transitions on non-existent
+    /// entities, out-of-range numeric fields. Called at ingest time so
+    /// the log never contains invalid events.
+    fn validate_event(&mut self, event: &WorldEvent) -> Result<(), RuntimeError> {
+        match event {
+            WorldEvent::ProjectCreated { id, .. } => {
+                if self.project_exists(id) {
+                    return Err(RuntimeError::DuplicateEntity {
+                        kind: "Project",
+                        id: id.clone(),
+                    });
+                }
+            }
+            WorldEvent::GoalCreated {
+                id, importance, ..
+            } => {
+                if self.goal_exists(id) {
+                    return Err(RuntimeError::DuplicateEntity {
+                        kind: "Goal",
+                        id: id.clone(),
+                    });
+                }
+                check_unit("importance", *importance)?;
+            }
+            WorldEvent::ProjectUpdated { id, .. } => {
+                if !self.project_exists(id) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Project",
+                        id: id.clone(),
+                    });
+                }
+            }
+            WorldEvent::GoalUpdated {
+                id, importance, ..
+            } => {
+                if !self.goal_exists(id) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Goal",
+                        id: id.clone(),
+                    });
+                }
+                if let Some(i) = importance {
+                    check_unit("importance", *i)?;
+                }
+            }
+            WorldEvent::SignalObserved { confidence, .. } => {
+                check_unit("confidence", *confidence)?;
+            }
+            WorldEvent::ProjectArchived { id, .. }
+            | WorldEvent::ProjectCompleted { id, .. }
+            | WorldEvent::ProjectReactivated { id } => {
+                if !self.project_exists(id) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Project",
+                        id: id.clone(),
+                    });
+                }
+            }
+            WorldEvent::GoalAchieved { id, .. }
+            | WorldEvent::GoalAbandoned { id, .. }
+            | WorldEvent::GoalReactivated { id } => {
+                if !self.goal_exists(id) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Goal",
+                        id: id.clone(),
+                    });
+                }
+            }
+            WorldEvent::TimePulseObserved { .. } => { /* no validation */ }
+        }
+        Ok(())
+    }
+
+    fn project_exists(&mut self, id: &str) -> bool {
+        let mut q = self.world.query::<(&Identity, &Project)>();
+        q.iter(&self.world).any(|(ident, _)| ident.0 == id)
+    }
+
+    fn goal_exists(&mut self, id: &str) -> bool {
+        let mut q = self.world.query::<(&Identity, &Goal)>();
+        q.iter(&self.world).any(|(ident, _)| ident.0 == id)
     }
 
     /// Test / fixture helper: ingest an event with an explicit timestamp.
@@ -313,6 +398,19 @@ impl WorldRuntime {
         self.log.replay_all().map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Number of Events past the current advance cursor. When > 0, the
+    /// last persisted `advance` output (in `last_advance.json`) is stale
+    /// — there are derivations the user has not yet acknowledged.
+    pub fn pending_events(&self) -> Result<usize, RuntimeError> {
+        let cursor = self.cursor.last_event_id.clone();
+        let events = self.log.replay_all()?;
+        let n = match cursor {
+            None => events.len(),
+            Some(c) => events.iter().filter(|e| e.id > c).count(),
+        };
+        Ok(n)
+    }
+
     /// Read the last `window` rows of `advances.jsonl` and compute, for
     /// each Project, the average per-advance change in
     /// `strategic_relevance`. Use this as the Trajectory slope.
@@ -385,6 +483,18 @@ impl WorldRuntime {
     }
 }
 
+fn check_unit(field: &'static str, value: f32) -> Result<(), RuntimeError> {
+    if !(0.0..=1.0).contains(&value) || value.is_nan() {
+        return Err(RuntimeError::ValueOutOfRange {
+            field,
+            value,
+            min: 0.0,
+            max: 1.0,
+        });
+    }
+    Ok(())
+}
+
 fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
     // Maintain time-tracking resources first so any system reading them
     // sees the new event's clock position.
@@ -412,6 +522,13 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
 
     match &stored.payload {
         WorldEvent::ProjectCreated { id, name, tags } => {
+            // Idempotent at the apply step: validate_event already rejected
+            // duplicates at ingest, but a hand-corrupted log shouldn't
+            // produce duplicate entities on replay.
+            let mut q = world.query::<&Identity>();
+            if q.iter(world).any(|i| i.0 == *id) {
+                return;
+            }
             world.spawn((
                 Identity(id.clone()),
                 Project::new(name.clone(), tags.clone()),
@@ -440,6 +557,10 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
             tags,
             importance,
         } => {
+            let mut q = world.query::<&Identity>();
+            if q.iter(world).any(|i| i.0 == *id) {
+                return;
+            }
             world.spawn((
                 Identity(id.clone()),
                 Goal::new(name.clone(), tags.clone(), *importance),
@@ -962,6 +1083,59 @@ mod tests {
             .flat_map(|r| r.causes.iter())
             .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
         assert!(rendered, "amplified change should carry a GoalAmplified cause");
+    }
+
+    #[test]
+    fn duplicate_project_id_is_rejected_at_ingest() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let result = rt.ingest(project("tnt", &["voice"]));
+        assert!(
+            matches!(result, Err(RuntimeError::DuplicateEntity { kind: "Project", .. })),
+            "expected DuplicateEntity error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn edit_of_nonexistent_project_is_rejected() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let result = rt.ingest(WorldEvent::ProjectUpdated {
+            id: "nope".into(),
+            name: Some("Whatever".into()),
+            tags: None,
+        });
+        assert!(
+            matches!(result, Err(RuntimeError::EntityNotFound { kind: "Project", .. })),
+            "expected EntityNotFound, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_confidence_is_rejected() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let result = rt.ingest(WorldEvent::SignalObserved {
+            source: "x".into(),
+            summary: "x".into(),
+            tags: vec!["ai".into()],
+            confidence: 5.0,
+            observed_at: None,
+        });
+        assert!(
+            matches!(result, Err(RuntimeError::ValueOutOfRange { field: "confidence", .. })),
+            "expected ValueOutOfRange, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn pending_events_reports_unadvanced_count() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("p", &["ai"])).unwrap();
+        rt.ingest(signal("s1", &["ai"], 0.5)).unwrap();
+        assert_eq!(rt.pending_events().unwrap(), 2);
+        rt.advance().unwrap();
+        assert_eq!(rt.pending_events().unwrap(), 0);
+        rt.ingest(signal("s2", &["ai"], 0.5)).unwrap();
+        assert_eq!(rt.pending_events().unwrap(), 1);
     }
 
     #[test]

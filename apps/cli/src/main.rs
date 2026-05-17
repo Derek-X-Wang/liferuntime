@@ -197,7 +197,38 @@ enum ExplainCmd {
     Latest,
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        eprint_friendly(&err);
+        std::process::exit(1);
+    }
+}
+
+fn eprint_friendly(err: &anyhow::Error) {
+    // Print the top-level message clearly, then walk the cause chain.
+    eprintln!("error: {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  cause: {cause}");
+        source = cause.source();
+    }
+
+    // Pattern-match the error string for actionable hints. We can't
+    // downcast cleanly through anyhow without exporting the concrete
+    // error types from every layer, and string-matching covers the
+    // common cases without leaking types.
+    let msg = format!("{err}");
+    if msg.contains("already exists") {
+        eprintln!("  hint: use the `edit` subcommand to modify the existing entity, \
+                   or pick a different id.");
+    } else if msg.contains("not found") {
+        eprintln!("  hint: list entities with `liferuntime status` or `liferuntime inspect`.");
+    } else if msg.contains("out of range") {
+        eprintln!("  hint: confidence and importance must be in [0.0, 1.0].");
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => cmd_init(&cli.dir)?,
@@ -362,10 +393,27 @@ fn main() -> Result<()> {
                 None => println!("Project not found: {id}"),
             }
         }
-        Command::Explain(ExplainCmd::Latest) => match load_last_advance(&cli.dir)? {
-            Some(e) => print!("{e}"),
-            None => println!("No advance has been recorded yet. Run `liferuntime advance`."),
-        },
+        Command::Explain(ExplainCmd::Latest) => {
+            let rt = WorldRuntime::open_dir(&cli.dir)?;
+            let pending = rt.pending_events()?;
+            drop(rt); // release flock before printing
+
+            match load_last_advance(&cli.dir)? {
+                Some(e) => {
+                    if pending > 0 {
+                        println!(
+                            "(stale — {pending} event(s) ingested since the last advance; \
+                             run `liferuntime advance` to refresh)",
+                        );
+                        println!();
+                    }
+                    print!("{e}");
+                }
+                None => {
+                    println!("No advance has been recorded yet. Run `liferuntime advance`.");
+                }
+            }
+        }
         Command::Replay => {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
             println!("Replayed {} events from {}.", rt.event_count(), cli.dir.display());
