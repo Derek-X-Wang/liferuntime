@@ -2,8 +2,8 @@ use bevy_ecs::prelude::*;
 
 use crate::explanation::{Cause, ChangeLog, ChangeRecord};
 use crate::model::{
-    Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
-    Unprocessed,
+    canonical_tag, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project,
+    ProjectStatus, Signal, Unprocessed,
 };
 
 pub fn register_systems(schedule: &mut Schedule) {
@@ -46,15 +46,15 @@ pub fn signal_project_matching_system(
             if project.status != ProjectStatus::Active {
                 continue;
             }
+            // Compare canonical forms ("AI Voice" matches "ai-voice").
+            // Keep the signal's original spelling in `matched` so the
+            // explanation cites what the user actually wrote.
+            let project_canonical: Vec<String> =
+                project.tags.iter().map(|t| canonical_tag(t)).collect();
             let matched: Vec<String> = signal
                 .tags
                 .iter()
-                .filter(|t| {
-                    project
-                        .tags
-                        .iter()
-                        .any(|pt| pt.eq_ignore_ascii_case(t))
-                })
+                .filter(|t| project_canonical.contains(&canonical_tag(t)))
                 .cloned()
                 .collect();
             if matched.is_empty() {
@@ -123,11 +123,12 @@ fn goal_amplifier(
         if goal.status != GoalStatus::Active {
             continue;
         }
-        let overlap = goal.tags.iter().any(|gt| {
-            signal_tags
-                .iter()
-                .any(|st| st.eq_ignore_ascii_case(gt))
-        });
+        let signal_canonical: Vec<String> =
+            signal_tags.iter().map(|t| canonical_tag(t)).collect();
+        let overlap = goal
+            .tags
+            .iter()
+            .any(|gt| signal_canonical.contains(&canonical_tag(gt)));
         if !overlap {
             continue;
         }

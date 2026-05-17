@@ -103,6 +103,25 @@ pub struct Signal {
 #[derive(Component, Default)]
 pub struct Unprocessed;
 
+/// Canonicalize a tag for matching purposes: lowercase, trim, collapse
+/// space / underscore to dash. So `"AI Voice"`, `"ai-voice"`, and
+/// `" Ai_voice "` all canonicalize to `"ai-voice"` and match each
+/// other in the matching/amplifier systems.
+///
+/// Storage keeps the user's original spelling (for display). Comparison
+/// uses this canonical form. Future synonym handling (aliases) could
+/// layer on top of this.
+pub fn canonical_tag(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.trim().chars() {
+        match ch {
+            ' ' | '_' => out.push('-'),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
 /// Records the last time (in event-log time) that a Project was *touched*
 /// by a relevant Signal — i.e. that the matching system found tag
 /// overlap. Used by the decay system to compute how stale the Project

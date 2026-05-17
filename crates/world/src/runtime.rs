@@ -849,6 +849,26 @@ mod tests {
     }
 
     #[test]
+    fn tag_matching_is_canonical_case_separator_insensitive() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(WorldEvent::ProjectCreated {
+            id: "tnt".into(),
+            name: "TNT".into(),
+            tags: vec!["ai-voice".into()],
+        })
+        .unwrap();
+        // Signal uses a different separator and case — should still match.
+        rt.ingest(signal("voice models", &["AI Voice"], 0.6))
+            .unwrap();
+        let changes = rt.advance().unwrap();
+        assert!(
+            changes.contains_change_for("tnt"),
+            "AI Voice should canonicalize to ai-voice and match: {:?}",
+            changes.records
+        );
+    }
+
+    #[test]
     fn achieved_goal_no_longer_amplifies_matching() {
         let mut runtime = WorldRuntime::in_memory().unwrap();
         runtime

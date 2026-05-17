@@ -300,6 +300,14 @@ Resonance → larger updates to the Project's strategic_relevance and
 urgency. Future versions may compute Resonance from embedding
 similarity, learned goal-conditioned scoring, or LLM judgment.
 
+Tag comparison uses light canonicalization: lowercase, trim, collapse
+spaces and underscores to dashes. So `"AI Voice"`, `"ai-voice"`, and
+`"ai_voice"` all match each other. Original spellings are preserved
+for display; only comparison uses the canonical form. Synonyms /
+abbreviations (`"AI"` vs `"artificial-intelligence"`) are *not*
+handled by canonicalization — a future alias mechanism could layer on
+top.
+
 When writing PRs, commit messages, or explanations, prefer "resonates
 with" / "weak resonance" / "high-resonance signal" over ad-hoc
 synonyms ("matches", "fits", "applies to").
