@@ -25,15 +25,14 @@ change.
 
 ## Advance
 
-A *reporting* operation, not a trigger. `WorldRuntime::advance` runs the
-schedule and emits the [Changes](#change) whose triggering Events fall
-past the persisted cursor, then moves the cursor forward.
+A *reporting* operation, not a trigger. `WorldRuntime::advance` reads
+the in-memory ChangeLog, emits the [Changes](#change) whose triggering
+Events fall past the persisted cursor, then moves the cursor forward.
 
-Critically, **state derivation is not gated by advance** — any read
-(`inspect`, `explain`) sees fully-derived state, because deterministic
-replay makes "when derivation happened" invisible to the caller. The
-distinction between Advance and a read is not whether state has
-changed; it is whether the caller has *acknowledged* the change.
+Under per-event scheduling (ADR-0006), systems run at every ingest —
+not at advance time. Advance therefore never *derives* state; it only
+*reports* what was already derived. Reads (`inspect`, `explain`) see
+fully-derived state whether or not the user has run `advance`.
 
 Mental model: "what's new since I last looked." Not: "world, take a
 step."

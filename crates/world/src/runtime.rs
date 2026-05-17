@@ -142,14 +142,14 @@ impl WorldRuntime {
     fn replay(&mut self) -> Result<(), RuntimeError> {
         let events = self.log.replay_all()?;
         for stored in events {
-            apply_event(&mut self.world, &stored);
+            self.apply_and_derive(&stored);
         }
         Ok(())
     }
 
     pub fn ingest(&mut self, event: WorldEvent) -> Result<IngestReceipt, RuntimeError> {
         let stored = self.log.append(event)?;
-        apply_event(&mut self.world, &stored);
+        self.apply_and_derive(&stored);
         Ok(IngestReceipt {
             event_id: stored.id,
         })
@@ -168,22 +168,26 @@ impl WorldRuntime {
             payload: event,
         };
         let stored = self.log.append_stored(stored)?;
-        apply_event(&mut self.world, &stored);
+        self.apply_and_derive(&stored);
         Ok(IngestReceipt {
             event_id: stored.id,
         })
     }
 
-    /// Derive current state without recording an "advance" cursor jump.
-    pub fn materialize(&mut self) -> Result<(), RuntimeError> {
+    /// Apply an event AND run the schedule against the resulting world
+    /// state. This is the per-event scheduling model (ADR-0006): every
+    /// event derives state immediately, so each event "sees" only the
+    /// past. Eliminates a class of temporal-coupling bugs at the cost of
+    /// O(N events × schedule) replay.
+    fn apply_and_derive(&mut self, stored: &StoredEvent<WorldEvent>) {
+        apply_event(&mut self.world, stored);
         self.schedule.run(&mut self.world);
-        Ok(())
     }
 
+    /// Report the changes triggered by events past the cursor, advance
+    /// the cursor, persist it. Does **not** run systems — under ADR-0006
+    /// systems already ran at ingest time. Advance is purely a reader.
     pub fn advance(&mut self) -> Result<WorldChanges, RuntimeError> {
-        self.world.resource_mut::<ChangeLog>().records.clear();
-        self.schedule.run(&mut self.world);
-
         let cursor_id = self.cursor.last_event_id.clone();
         let records = self.world.resource::<ChangeLog>().records.clone();
         let new_records: Vec<ChangeRecord> = records
@@ -356,7 +360,6 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 if ident.0 == *id {
                     project.status = ProjectStatus::Archived;
                     project.archived_reason = reason.clone();
-                    project.closed_at = Some(stored.occurred_at);
                     break;
                 }
             }
@@ -367,7 +370,6 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 if ident.0 == *id {
                     project.status = ProjectStatus::Completed;
                     project.completion_note = note.clone();
-                    project.closed_at = Some(stored.occurred_at);
                     break;
                 }
             }
@@ -379,7 +381,6 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                     project.status = ProjectStatus::Active;
                     project.archived_reason = None;
                     project.completion_note = None;
-                    project.closed_at = None;
                     break;
                 }
             }
@@ -550,7 +551,8 @@ mod tests {
         runtime
             .ingest(signal("voice models", &["voice", "ai"], 0.9))
             .unwrap();
-        runtime.materialize().unwrap();
+        // Under per-event scheduling (ADR-0006), state is already
+        // derived — no explicit materialize step needed.
         let view = runtime.inspect_project("p1").expect("project exists");
         assert!(
             view.strategic_relevance > 0.5,
@@ -583,8 +585,7 @@ mod tests {
             .unwrap();
         }
 
-        a.materialize().unwrap();
-        b.materialize().unwrap();
+        // State already derived per-event under ADR-0006.
 
         let va = a.inspect_project("tnt").unwrap();
         let vb = b.inspect_project("tnt").unwrap();
@@ -627,9 +628,10 @@ mod tests {
         }
 
         // Third "CLI invocation": inspect. Should still show the
-        // pre-archival match's effect on relevance.
+        // pre-archival match's effect on relevance — under per-event
+        // scheduling (ADR-0006) state is derived during open_dir's
+        // replay, so no materialize step is needed.
         let mut rt = WorldRuntime::open_dir(&dir).unwrap();
-        rt.materialize().unwrap();
         let view = rt.inspect_project("tnt").expect("project exists");
         assert_eq!(view.status, ProjectStatus::Archived);
         assert!(
@@ -678,7 +680,8 @@ mod tests {
 
         // Don't advance — just materialize. Matching should run for the
         // signal because it arrived before the archive.
-        runtime.materialize().unwrap();
+        // Under per-event scheduling (ADR-0006), state is already
+        // derived — no explicit materialize step needed.
 
         let view = runtime.inspect_project("p1").expect("project exists");
         assert_eq!(view.status, ProjectStatus::Archived);
@@ -706,6 +709,11 @@ mod tests {
                 t0 + Duration::minutes(1),
             )
             .unwrap();
+        // Signal arrives AFTER archive — under per-event scheduling the
+        // matching system sees an Archived project and skips. (Replay
+        // order also yields archive-then-signal, matching the live
+        // order, because each event runs the schedule against the
+        // then-current world.)
         runtime
             .ingest_at(
                 signal("voice models improving", &["ai", "voice"], 1.0),

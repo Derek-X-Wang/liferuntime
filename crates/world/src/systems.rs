@@ -37,11 +37,12 @@ pub fn signal_project_matching_system(
         let (factor, amplifier_cause) = goal_amplifier(&goal_snapshot, &signal.tags);
 
         for (project_entity, project_id, mut project) in &mut projects {
-            // Closed projects only accept signals that arrived BEFORE
-            // closure. This keeps replay honest: archiving a project
-            // today shouldn't erase the effect of signals from last
-            // month.
-            if !project.accepts_signal_at(signal.observed_at) {
+            // Under per-event scheduling (ADR-0006), matching runs at
+            // the moment a signal is ingested. Archive events that
+            // arrive *after* this signal haven't happened yet from
+            // matching's perspective, so the project is still Active
+            // here. A simple status check is correct.
+            if project.status != ProjectStatus::Active {
                 continue;
             }
             let matched: Vec<String> = signal

@@ -280,8 +280,9 @@ fn main() -> Result<()> {
             print_advance(&cli.dir, &changes)?;
         }
         Command::Inspect(InspectCmd::Project { id }) => {
+            // Under ADR-0006 (per-event scheduling), open_dir already
+            // derives state. No materialize step needed.
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
-            rt.materialize()?;
             match rt.inspect_project(&id) {
                 Some(view) => print_project(&view),
                 None => println!("Project not found: {id}"),
