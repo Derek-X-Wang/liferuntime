@@ -116,6 +116,15 @@ The user's interpreted strategic world. Contains the user's Projects,
 Goals, Constraints, beliefs, Risks, Opportunities, and Trajectories. The
 default scope of LifeRuntime v1.
 
+The boundary between Personal and Factual is intentionally deferred in
+the implementation — today every event lives in the user's single
+Personal World, with no `world_kind` tag. The long-term frame is
+**composability**: a Personal World may optionally subscribe to one or
+more public Factual logs published by other runtimes. The mechanism
+(subscription protocol, identity, conflict semantics) deserves its own
+grill session before code lands. Until then, "Factual World" is
+vocabulary, not infrastructure.
+
 ## Entity
 
 A thing inside the World that can accumulate state over time — Project,
@@ -125,7 +134,17 @@ Goal, InvestmentPosition, Commitment, Risk, Opportunity, etc.
 
 A long-running creative, technical, personal, or business effort the user
 may invest time, money, and attention into. Has tags, strategic_relevance,
-urgency, momentum, maintenance_burden, and a **status**.
+urgency, momentum, maintenance_burden, a **status**, and an optional
+`depends_on: Vec<ProjectId>` annotation.
+
+### `depends_on`
+
+A light declarative annotation: "this project needs that one to make
+sense." Surfaced in `inspect` only — **no system effects** in v1. A
+Decision graph or cascading decay may layer on top later, but the
+annotation alone does not change relevance, urgency, or recommendations.
+Cycles are permitted (rendered flat); references to unknown project ids
+are rejected at ingest.
 
 ### ProjectStatus
 
@@ -188,6 +207,117 @@ Goals are intentionally symmetric with [Project](#project)'s lifecycle —
 but use value-charged verbs (Achieved / Abandoned) instead of neutral
 ones (Completed / Archived) because Goals have an evaluative dimension
 Projects don't.
+
+Goals have **no `progress` field by design**. The Active → Achieved
+transition captures the only structurally meaningful change; partial
+progress is left to the user's head until a system actually needs it
+(e.g., a recommender that wants to back off on near-complete goals).
+Premature commitment to a `progress: f32` would be a maintenance tax
+without a consumer.
+
+## Decision
+
+A recorded strategic choice — "I'm putting weight on Project X." Decisions
+are Events (the user inputs them) and bias the simulation while in force.
+
+Scope: **Projects only in v1.** Goals already carry status (Achieved /
+Active / Abandoned). Signals are facts, not choices.
+
+A Decision has:
+
+- `chose: ProjectId` — the committed-to project (required)
+- `over: Vec<ProjectId>` — narrative rivals; **no mechanical effect**
+- `dampen: Vec<ProjectId>` — explicit mechanical suppression set
+- `reason: Option<String>` — free text
+- `decided_at: Option<DateTime<Utc>>` — defaults to ingest time
+
+`over` and `dampen` are **deliberately separate**. `over` is a historical
+record of what the user weighed against — explanations cite it as
+"considered alternatives." `dampen` is the opt-in mechanical effect.
+The lists may overlap (the common case for "I chose X over Y AND want Y
+quieted") but neither requires the other.
+
+### Per-project stance
+
+The runtime tracks, by replay, a **per-project stance**:
+
+- `Chosen { decision_id, boost_remaining }` — receives a decaying
+  positive boost on `strategic_relevance`.
+- `Dampened { decision_id }` — resonance deltas are scaled by `0.3`
+  and Goal amplification is suppressed (mutually exclusive with normal
+  goal amp).
+- absent — no Decision currently steers this project.
+
+**Most-recent Decision wins per project**, by replay order (not
+`decided_at`, not `EventId`). A single Decision can be *partially*
+superseded: Decision-A still steers TNT but a later Decision-B steers
+Side-X. "Active" is a per-project claim, not a global one.
+
+If two active Decisions both name the same project as `chose`, the
+later one replaces the earlier — boosts do **not** stack. Likewise for
+`dampen`.
+
+### Chosen: decaying boost (not a floor)
+
+On `DecisionRecorded` with `chose: P`:
+
+- Initial boost: **+0.15** applied to P's `strategic_relevance`.
+- Boost decays slowly at factor **≈ 0.999 / event-log day** (vs. normal
+  project decay ≈ 0.99 / day), toward zero.
+- Displayed relevance = `raw_relevance + boost_remaining`, clamped to
+  `[0.0, 1.0]`.
+
+The boost preserves the runtime's smooth-curve nature: a Decision biases
+attention but **entropy still runs**. A Decision left untouched for
+months naturally erodes back toward baseline — the system itself nudges
+the user to either reaffirm (by ingesting fresh signals about P) or
+revoke. No protected zone hides a stale commitment.
+
+ChangeRecords cite
+`Cause::DecisionBoostApplied { decision_id, contribution }` on each
+tick while the boost contribution is non-trivial.
+
+### Dampened: ×0.3 with goal amp suppressed
+
+For each project P in `dampen` of an active Decision:
+
+- Resonance deltas targeting P: `delta := base_resonance × confidence
+  × 0.3`. Goal amplification does **not apply** to dampened projects.
+  The user's explicit opt-in beats implicit goal-tag overlap.
+- Decay on P runs normally.
+
+ChangeRecords cite `Cause::DecisionDampened { decision_id, factor: 0.3 }`.
+
+### Lifecycle
+
+A Decision is active for a project until one of:
+
+1. **Superseded** — a later Decision names that project in `chose` or
+   `dampen`, flipping its stance. Per-project; partial supersession is
+   normal.
+2. **Revoked** — explicit `DecisionRevoked { decision_id }` event.
+   `decision_id` must reference a prior `DecisionRecorded`; ingest
+   rejects unknown ids. Replay of a corrupted log emits a diagnostic
+   and ignores the orphan revoke.
+
+There is **no auto-expiry**. The decaying boost erodes naturally;
+explicit revocation is for the "drop without replacement" case.
+
+### CLI
+
+```
+liferuntime decide --chose tnt [--over side-x] [--dampen side-y] [--because "..."]
+liferuntime decision list                    # active per-project stances
+liferuntime decision revoke <decision-id>
+```
+
+`liferuntime decision list` shows each active Decision with the
+projects it currently steers (chose or dampens) and remaining boost
+contribution — partial supersession is visible (e.g. *"Decision
+`dec-0001` still steers TNT (boost 0.087); superseded for Side-X by
+`dec-0004`"*).
+
+*Not yet implemented; design locked in ADR-0008.*
 
 ## Constraint
 
@@ -286,6 +416,18 @@ thresholds.*
 A human-readable causal chain describing why a World change or
 Recommendation happened. Surfaced via `WorldRuntime::explain`.
 
+Two scopes:
+
+- **Default** — Changes from the most recent Advance only. The
+  "what just happened" view.
+- **Full history** — every ChangeRecord that ever touched the target
+  entity, in event-log order. Surfaced via `liferuntime explain
+  project <id> --all`. ChangeRecords only — the entity's `Created`
+  event is not part of the chain (read the event log directly for that).
+  An entity with no Changes yet renders an explicit "no changes yet"
+  line plus a brief inspect-style summary, so the command is never
+  empty.
+
 ## Scenario
 
 A hypothetical branch of future Events evaluated against a fork of the
@@ -309,7 +451,15 @@ A delta produced by a system: a field on an entity moved from `before` to
 ## Cause
 
 Provenance for a Change — the Signal that matched, the tag overlap, the
-confidence. The lowest-level building block of an Explanation.
+confidence, the [Goal](#goal) that amplified, the [Decision](#decision)
+that boosted or dampened. The lowest-level building block of an
+Explanation.
+
+Cause variants are **structured**, not strings. Adding a new system
+effect (e.g. the Decision boost and dampening) means adding new typed
+variants such as `DecisionBoostApplied { decision_id, contribution }`
+and `DecisionDampened { decision_id, factor }`, so explanations remain
+queryable, testable, and refactor-safe.
 
 ## Resonance
 
@@ -333,6 +483,27 @@ top.
 When writing PRs, commit messages, or explanations, prefer "resonates
 with" / "weak resonance" / "high-resonance signal" over ad-hoc
 synonyms ("matches", "fits", "applies to").
+
+Resonance interacts with two upstream pulls in v1, applied
+**mutually exclusively** per project:
+
+- **Decision dampening** — if the target Project's current stance is
+  `Dampened` by an active [Decision](#decision), the resonance delta is
+  scaled by `0.3`. Goal amplification does **not** apply to dampened
+  projects; the user's explicit per-project opt-in beats implicit
+  goal-tag overlap.
+- **Goal amplification** — for any project not currently dampened, an
+  active [Goal](#goal) whose tags overlap the Signal's tags multiplies
+  the resonance delta by `1 + 0.5 * importance`.
+
+The chosen-project boost is a separate concern: it is applied as an
+additive layer on `strategic_relevance` (see
+[Decision: Chosen](#chosen-decaying-boost-not-a-floor)), not as a
+multiplier on resonance deltas.
+
+Upstream effects are recorded as Causes on the resulting ChangeRecord,
+so explanations can name the amplifying Goal or dampening Decision by
+id.
 
 ## Alignment
 
