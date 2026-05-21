@@ -164,3 +164,43 @@ impl LatestEventId {
         self.0.as_ref()
     }
 }
+
+/// Derived per-Project stance imposed by the **most-recent Decision per
+/// project** (ADR-0008 `#per-project-stance-derived-by-replay`).
+///
+/// Absence of the component on a Project entity means "no Decision
+/// currently steers this project." `Chosen` and `Dampened` are mutually
+/// exclusive — a later Decision flips one to the other in place.
+///
+/// This slice (issue #2) carries the stance shape only; the decaying
+/// boost (issue #4) and the matching-side dampening (issue #5) are
+/// layered on top in later slices.
+#[derive(Component, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionStance {
+    Chosen { decision_id: EventId },
+    Dampened { decision_id: EventId },
+}
+
+impl DecisionStance {
+    /// The id of the Decision that currently steers a project.
+    pub fn decision_id(&self) -> &EventId {
+        match self {
+            Self::Chosen { decision_id } | Self::Dampened { decision_id } => decision_id,
+        }
+    }
+}
+
+/// Transient component spawned by `apply_event` for every
+/// [`crate::WorldEvent::DecisionRecorded`]. The
+/// `decision_application_system` consumes pending decisions during the
+/// next schedule run, flips the targeted Project stances, then despawns
+/// the marker. Replay rebuilds the same final per-project stance
+/// because per-event scheduling (ADR-0006) re-runs the system after
+/// every event in order.
+#[derive(Component, Clone, Debug)]
+pub struct PendingDecision {
+    pub decision_id: EventId,
+    pub chose: String,
+    pub dampen: Vec<String>,
+}

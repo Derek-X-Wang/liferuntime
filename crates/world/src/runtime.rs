@@ -13,8 +13,8 @@ use crate::errors::RuntimeError;
 use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
 use crate::model::{
-    Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project, ProjectStatus, Signal,
-    Unprocessed,
+    DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, PendingDecision,
+    Project, ProjectStatus, Signal, Unprocessed,
 };
 use crate::queries::{ProjectTrajectoryView, ProjectView};
 use crate::systems::register_systems;
@@ -379,6 +379,23 @@ impl WorldRuntime {
         })
     }
 
+    /// Current per-project Decision stance, keyed by project id. Built
+    /// by replay of `DecisionRecorded` events via the
+    /// `decision_application_system` (ADR-0008
+    /// `#per-project-stance-derived-by-replay`).
+    ///
+    /// **Source of truth for all Decision-driven mechanics.** The
+    /// decaying-boost system (issue #4), resonance dampening (issue
+    /// #5), and the `decision list` CLI (issue #7) all consume *this*
+    /// API rather than walking the event log themselves — there must
+    /// be one derivation of stance, not several.
+    pub fn decision_stances(&mut self) -> HashMap<String, DecisionStance> {
+        let mut q = self.world.query::<(&Identity, &DecisionStance)>();
+        q.iter(&self.world)
+            .map(|(ident, stance)| (ident.0.clone(), stance.clone()))
+            .collect()
+    }
+
     pub fn inspect_project(&mut self, id: &str) -> Option<ProjectView> {
         let mut q = self.world.query::<(&Identity, &Project)>();
         for (ident, project) in q.iter(&self.world) {
@@ -690,10 +707,24 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 }
             }
         }
-        WorldEvent::DecisionRecorded { .. } => {
-            // Tracer slice (issue #1): event lands in the log and the
-            // resource clock advances, but derived state is untouched.
-            // Stance derivation arrives in issue #2.
+        WorldEvent::DecisionRecorded { chose, dampen, .. } => {
+            // Issue #2: spawn a PendingDecision so the
+            // `decision_application_system` (running on the per-event
+            // schedule from ADR-0006) flips targeted project stances
+            // before any later system observes them. The transient
+            // entity is despawned by the system after it applies the
+            // stance changes.
+            //
+            // `over` is deliberately not carried into the ECS — per
+            // ADR-0008 it has no mechanical effect; consumers that
+            // want narrative rivals (e.g. `decision list` polish in
+            // issue #7) read the original event from the log by
+            // decision_id.
+            world.spawn(PendingDecision {
+                decision_id: stored.id.clone(),
+                chose: chose.clone(),
+                dampen: dampen.clone(),
+            });
         }
     }
 }
@@ -1583,6 +1614,208 @@ mod tests {
             tnt.strategic_relevance
         );
         assert!((side.strategic_relevance - 0.5).abs() < 1e-6);
+    }
+
+    // -------- Decision: per-project stance derivation (issue #2) --------
+
+    use crate::model::DecisionStance;
+
+    #[test]
+    fn decision_stance_single_chosen_and_dampened() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+
+        let receipt = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec!["side-x".into()],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: receipt.event_id.clone()
+            }),
+            "tnt should be Chosen by the new decision, got {stances:?}",
+        );
+        assert_eq!(
+            stances.get("side-x"),
+            Some(&DecisionStance::Dampened {
+                decision_id: receipt.event_id.clone()
+            }),
+            "side-x should be Dampened by the new decision",
+        );
+    }
+
+    #[test]
+    fn decision_stance_partial_supersession() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+
+        let dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "side-x".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_a.event_id.clone()
+            }),
+            "tnt should still be steered by Decision A (partial supersession): {stances:?}",
+        );
+        assert_eq!(
+            stances.get("side-x"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            }),
+            "side-x should now be steered by Decision B (overrides A's dampen)",
+        );
+    }
+
+    #[test]
+    fn decision_stance_chose_then_dampen_flips_stance() {
+        // Decision A chose: tnt; later Decision B dampens tnt.
+        // tnt's stance flips to Dampened by B.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("y", &[])).unwrap();
+
+        let _dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["y".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "y".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Dampened {
+                decision_id: dec_b.event_id.clone()
+            })
+        );
+        assert_eq!(
+            stances.get("y"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            })
+        );
+    }
+
+    #[test]
+    fn decision_stance_same_decided_at_uses_replay_order() {
+        let t = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t).unwrap();
+
+        let dec_a = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t),
+                },
+                t + Duration::seconds(1),
+            )
+            .unwrap();
+        let dec_b = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t),
+                },
+                t + Duration::seconds(2),
+            )
+            .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            }),
+            "later-in-log Decision should win even with identical decided_at",
+        );
+        assert!(
+            !stances.values().any(|s| {
+                let id = match s {
+                    DecisionStance::Chosen { decision_id }
+                    | DecisionStance::Dampened { decision_id } => decision_id,
+                };
+                id == &dec_a.event_id
+            }),
+            "Decision A should no longer steer any project: {stances:?}",
+        );
+    }
+
+    #[test]
+    fn decision_stance_persists_through_open_dir_replay() {
+        let dir = tempfile_dir();
+
+        let dec_id_str;
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(project("tnt", &["ai"])).unwrap();
+            let dec = rt
+                .ingest(WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                })
+                .unwrap();
+            dec_id_str = dec.event_id.0.clone();
+        }
+
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let stances = rt.decision_stances();
+        match stances.get("tnt") {
+            Some(DecisionStance::Chosen { decision_id }) => {
+                assert_eq!(decision_id.0, dec_id_str);
+            }
+            other => panic!("expected Chosen after replay, got {other:?}"),
+        }
     }
 
     #[test]
