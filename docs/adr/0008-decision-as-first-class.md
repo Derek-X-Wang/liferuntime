@@ -103,9 +103,12 @@ A Decision steers a project until:
 1. **Superseded** — a later Decision names that project (per-project
    override, by replay order).
 2. **Revoked** — explicit `DecisionRevoked`. `decision_id` must
-   reference a prior `DecisionRecorded`; ingest rejects unknown ids,
-   replay of a corrupted log emits a diagnostic and ignores the orphan
-   revoke.
+   reference a prior `DecisionRecorded`; **ingest rejects unknown ids
+   loudly**. **Replay silently ignores** an orphan revoke in a
+   corrupted log — consistent with the existing replay tolerance for
+   impossible updates in `apply_event`. Adding a structured diagnostic
+   channel for corrupted-log conditions is a separate concern not
+   gated by this ADR.
 
 **No auto-expiry.** The decaying boost erodes naturally.
 

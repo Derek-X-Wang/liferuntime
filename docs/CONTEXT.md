@@ -296,9 +296,12 @@ A Decision is active for a project until one of:
    `dampen`, flipping its stance. Per-project; partial supersession is
    normal.
 2. **Revoked** — explicit `DecisionRevoked { decision_id }` event.
-   `decision_id` must reference a prior `DecisionRecorded`; ingest
-   rejects unknown ids. Replay of a corrupted log emits a diagnostic
-   and ignores the orphan revoke.
+   `decision_id` must reference a prior `DecisionRecorded`; **ingest
+   rejects unknown ids loudly**. **Replay silently ignores** an orphan
+   revoke in a corrupted log, matching the existing replay tolerance
+   for impossible updates in `apply_event`. A structured diagnostic
+   channel for corrupted-log conditions is a separate (deferred)
+   concern.
 
 There is **no auto-expiry**. The decaying boost erodes naturally;
 explicit revocation is for the "drop without replacement" case.
