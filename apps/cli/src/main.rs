@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
 use liferuntime_event_log::EventId;
 use liferuntime_world::{
-    format_decision_list, Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView,
-    WorldChanges, WorldEvent, WorldRuntime,
+    format_decision_list, ChangeRecord, Explanation, ProjectStatus, ProjectTrajectoryView,
+    ProjectView, WorldChanges, WorldEvent, WorldRuntime,
 };
 use std::path::{Path, PathBuf};
 
@@ -243,7 +243,18 @@ enum InspectCmd {
 
 #[derive(Subcommand)]
 enum ExplainCmd {
+    /// Render the most recent advance — the "what just happened" view.
     Latest,
+    /// Show changes for a Project. Default is the most-recent-Advance
+    /// window (mirrors `explain latest`, filtered by entity_id).
+    /// `--all` (alias `--full`) prints every ChangeRecord that has ever
+    /// touched the project, in event-log order — the "git log" view.
+    Project {
+        id: String,
+        /// Print the full causal history (CONTEXT.md `#explanation`).
+        #[arg(long, alias = "full")]
+        all: bool,
+    },
 }
 
 fn main() {
@@ -468,6 +479,64 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::Explain(ExplainCmd::Project { id, all }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            if all {
+                // Full causal history. `explain_project_history` does
+                // the entity-existence check; an unknown id propagates
+                // as `EntityNotFound` and the CLI exits non-zero via
+                // `eprint_friendly`.
+                let explanation = rt.explain_project_history(&id)?;
+                if explanation.records.is_empty() {
+                    let view = rt
+                        .inspect_project(&id)
+                        .expect("project_exists already verified by explain_project_history");
+                    print_empty_history_state("Project", &view);
+                } else {
+                    print!("{explanation}");
+                }
+            } else {
+                // Most-recent-Advance window filtered by entity. Probe
+                // existence first so unknown ids exit non-zero.
+                let view = match rt.inspect_project(&id) {
+                    Some(v) => v,
+                    None => anyhow::bail!("Project not found: {id}"),
+                };
+                let pending = rt.pending_events()?;
+                drop(rt);
+                match load_last_advance(&cli.dir)? {
+                    Some(e) => {
+                        let filtered: Vec<ChangeRecord> = e
+                            .records
+                            .into_iter()
+                            .filter(|r| r.entity_id == id)
+                            .collect();
+                        if pending > 0 {
+                            println!(
+                                "(stale — {pending} event(s) ingested since the last advance; \
+                                 run `liferuntime advance` to refresh)",
+                            );
+                            println!();
+                        }
+                        if filtered.is_empty() {
+                            println!(
+                                "No changes for project {id} in the most recent advance. \
+                                 Pass --all to see the full history.",
+                            );
+                            println!();
+                            println!("Current state (from inspect):");
+                            println!("{}", one_line_project_summary(&view));
+                        } else {
+                            let explanation = Explanation { records: filtered };
+                            print!("{explanation}");
+                        }
+                    }
+                    None => {
+                        println!("No advance has been recorded yet. Run `liferuntime advance`.");
+                    }
+                }
+            }
+        }
         Command::Replay => {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
             println!(
@@ -554,6 +623,43 @@ fn print_advance(dir: &Path, changes: &WorldChanges) -> Result<()> {
     print!("{explanation}");
     save_last_advance(dir, &explanation)?;
     Ok(())
+}
+
+/// One-line condensed project summary for the `explain --all` empty
+/// state and the default-window "no changes for X" branch (issue #16).
+/// Mirrors the fields the multi-line `inspect` view prints, compressed
+/// onto a single line so the empty-state block stays scannable.
+fn one_line_project_summary(p: &ProjectView) -> String {
+    let status_label = match p.status {
+        ProjectStatus::Active => "active",
+        ProjectStatus::Archived => "archived",
+        ProjectStatus::Completed => "completed",
+    };
+    let depends_part = if p.depends_on.is_empty() {
+        String::new()
+    } else {
+        format!(" depends_on=[{}]", p.depends_on.join(", "))
+    };
+    format!(
+        "Project: {} ({}) [{}] tags=[{}]{} relevance={:.2} urgency={:.2}",
+        p.name,
+        p.id,
+        status_label,
+        p.tags.join(", "),
+        depends_part,
+        p.strategic_relevance_visible,
+        p.urgency,
+    )
+}
+
+/// Friendly "no changes yet" block for the `--all` empty state (issue
+/// #16). Symmetric with `git log` printing an empty-state hint instead
+/// of returning silently.
+fn print_empty_history_state(kind: &str, p: &ProjectView) {
+    println!("No changes yet for {kind} {}.", p.id);
+    println!();
+    println!("Current state (from inspect):");
+    println!("{}", one_line_project_summary(p));
 }
 
 fn print_project(p: &ProjectView) {

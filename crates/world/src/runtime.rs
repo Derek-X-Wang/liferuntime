@@ -582,6 +582,35 @@ impl WorldRuntime {
         Ok(Explanation { records: scoped })
     }
 
+    /// Full causal history for a Project (CONTEXT.md `#explanation`,
+    /// issue #16): every `ChangeRecord` whose `entity_id` matches the
+    /// target, sorted by triggering event id (event-log order).
+    ///
+    /// ChangeRecord-only — the `ProjectCreated` event is **not** part
+    /// of the chain (read the event log directly for creation context).
+    /// An untouched project returns `Ok(Explanation { records: vec![] })`;
+    /// callers render the friendly "no changes yet" state. Unknown ids
+    /// return `Err(EntityNotFound)` so the CLI can exit non-zero.
+    pub fn explain_project_history(&mut self, id: &str) -> Result<Explanation, RuntimeError> {
+        if !self.project_exists(id) {
+            return Err(RuntimeError::EntityNotFound {
+                kind: "Project",
+                id: id.to_string(),
+            });
+        }
+        let records = self.world.resource::<ChangeLog>().records.clone();
+        let mut filtered: Vec<ChangeRecord> =
+            records.into_iter().filter(|r| r.entity_id == id).collect();
+        // Insertion order is already event-log order under per-event
+        // scheduling (ADR-0006), but pin the contract with an explicit
+        // stable sort so callers can rely on it independently of the
+        // schedule shape. `sort_by` is stable, preserving the relative
+        // order of records emitted by the same event (e.g. matching's
+        // strategic_relevance + urgency pair).
+        filtered.sort_by(|a, b| a.triggered_by_event.cmp(&b.triggered_by_event));
+        Ok(Explanation { records: filtered })
+    }
+
     pub fn event_count(&self) -> usize {
         self.log.replay_all().map(|v| v.len()).unwrap_or(0)
     }
@@ -3721,6 +3750,172 @@ mod tests {
             a.depends_on.is_empty(),
             "old log entry without depends_on must deserialize as empty, got {:?}",
             a.depends_on
+        );
+    }
+
+    // -------- Explain: full causal history (issue #16) --------
+    //
+    // `explain_project_history` returns every ChangeRecord whose
+    // `entity_id` matches the target project, in event-log order
+    // (CONTEXT.md `#explanation`). ChangeRecord-only — the
+    // `ProjectCreated` event is **not** part of the chain. Empty list
+    // for an untouched project; loud error for an unknown id.
+
+    #[test]
+    fn explain_project_history_empty_for_untouched_project() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("alone", &["ai"])).unwrap();
+        let explanation = rt.explain_project_history("alone").expect("project exists");
+        assert!(
+            explanation.records.is_empty(),
+            "untouched project should produce no history records, got {:?}",
+            explanation.records,
+        );
+    }
+
+    #[test]
+    fn explain_project_history_excludes_creation_event() {
+        // Pin the spec: ProjectCreated is NOT a ChangeRecord (only
+        // system-derived effects are). The single ChangeRecord here is
+        // the signal-driven relevance bump, not the project spawn.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai", "voice"])).unwrap();
+        rt.ingest(signal("voice progress", &["voice", "ai"], 0.6))
+            .unwrap();
+        let explanation = rt.explain_project_history("tnt").unwrap();
+        // Two records (relevance + urgency from the signal match) — no
+        // creation entry, no extra phantom records.
+        assert!(
+            !explanation.records.is_empty(),
+            "signal match should yield ChangeRecords",
+        );
+        for r in &explanation.records {
+            assert!(
+                matches!(r.field.as_str(), "strategic_relevance" | "urgency"),
+                "history must contain only system-derived fields, got {}",
+                r.field
+            );
+        }
+    }
+
+    #[test]
+    fn explain_project_history_orders_records_chronologically_across_advances() {
+        // Multiple advance windows with decay between signals — confirm
+        // every record makes it into the history, in event-log order.
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest_at(project("p", &["ai", "voice"]), t0).unwrap();
+        rt.ingest_at(
+            signal("voice news", &["voice"], 0.7),
+            t0 + Duration::minutes(1),
+        )
+        .unwrap();
+        rt.advance().unwrap();
+        rt.ingest_at(
+            WorldEvent::TimePulseObserved {
+                observed_at: t0 + Duration::days(30),
+            },
+            t0 + Duration::days(30),
+        )
+        .unwrap();
+        rt.advance().unwrap();
+        rt.ingest_at(
+            signal("more voice news", &["voice"], 0.6),
+            t0 + Duration::days(31),
+        )
+        .unwrap();
+        rt.advance().unwrap();
+
+        let explanation = rt.explain_project_history("p").unwrap();
+        assert!(
+            explanation.records.len() >= 3,
+            "expected ≥3 records (initial match + decay + new match), got {}",
+            explanation.records.len(),
+        );
+        // Triggering event ids are sorted ascending (ULIDs are
+        // lexicographically chronological).
+        for w in explanation.records.windows(2) {
+            assert!(
+                w[0].triggered_by_event <= w[1].triggered_by_event,
+                "records out of event-log order: {:?} > {:?}",
+                w[0].triggered_by_event,
+                w[1].triggered_by_event,
+            );
+        }
+    }
+
+    #[test]
+    fn explain_project_history_filters_by_entity_id() {
+        // Two projects, signals to each — history for one returns only
+        // its records, no cross-talk.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &["ai"])).unwrap();
+        rt.ingest(project("b", &["voice"])).unwrap();
+        rt.ingest(signal("ai news", &["ai"], 0.6)).unwrap();
+        rt.ingest(signal("voice news", &["voice"], 0.6)).unwrap();
+
+        let history_a = rt.explain_project_history("a").unwrap();
+        assert!(!history_a.records.is_empty(), "a should have records");
+        for r in &history_a.records {
+            assert_eq!(
+                r.entity_id, "a",
+                "history for 'a' must not leak 'b' records"
+            );
+        }
+        let history_b = rt.explain_project_history("b").unwrap();
+        assert!(!history_b.records.is_empty(), "b should have records");
+        for r in &history_b.records {
+            assert_eq!(
+                r.entity_id, "b",
+                "history for 'b' must not leak 'a' records"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_project_history_returns_error_for_unknown_id() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("real", &["ai"])).unwrap();
+        let result = rt.explain_project_history("ghost");
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
+            "unknown id should be loud, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn explain_project_history_performance_under_1k_events() {
+        // Acceptance #6: ~1,000 events, --all completes well under 1s.
+        // Run the query on the busiest project and measure wall-clock
+        // time around the call only (build-up time excluded).
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("hot", &["ai", "voice"])).unwrap();
+        rt.ingest(project("cold", &["unrelated"])).unwrap();
+        // 1,000 - 2 = 998 signals; the matching system emits ≥1 record
+        // per matching signal so the resulting ChangeLog is large.
+        for i in 0..998 {
+            let tag = if i % 2 == 0 { "ai" } else { "voice" };
+            rt.ingest(signal(&format!("s{i}"), &[tag], 0.4)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let history = rt
+            .explain_project_history("hot")
+            .expect("hot project exists");
+        let elapsed = started.elapsed();
+        assert!(
+            !history.records.is_empty(),
+            "expected history records, log was non-trivial",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "explain_project_history over ~1k events should run \
+             well under 1s, took {elapsed:?}",
         );
     }
 }
