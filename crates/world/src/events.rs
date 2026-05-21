@@ -93,6 +93,33 @@ pub enum WorldEvent {
     GoalReactivated {
         id: String,
     },
+    /// A user-recorded strategic Decision (ADR-0008).
+    ///
+    /// `chose` is the committed-to Project. `over` is a narrative-only
+    /// list of considered rivals — **no mechanical effect**, surfaced
+    /// later by `explain` / `decision list`. `dampen` is the explicit
+    /// mechanical suppression set; per ADR-0008 these are deliberately
+    /// separate so users can record "I chose TNT over Side-X" without
+    /// silently muting Side-X.
+    ///
+    /// In this slice (issue #1) the event is plumbed through ingest,
+    /// validation, and replay with **no derived effects**. Stance
+    /// derivation, boost, and dampening land in issues #2..#6.
+    ///
+    /// `decided_at` is optional; when absent, downstream systems read
+    /// the envelope's `occurred_at` (the runtime's ingest time, or the
+    /// explicit `ingest_at` timestamp in tests).
+    DecisionRecorded {
+        chose: String,
+        #[serde(default)]
+        over: Vec<String>,
+        #[serde(default)]
+        dampen: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        decided_at: Option<DateTime<Utc>>,
+    },
 }
 
 fn default_importance() -> f32 {
