@@ -34,9 +34,7 @@ pub enum Cause {
     /// Time-based drift back toward baseline because no recent Signal
     /// matched this Project. `days_elapsed` is in event-log days, not
     /// wall-clock (ADR-0004).
-    Decay {
-        days_elapsed: f32,
-    },
+    Decay { days_elapsed: f32 },
     /// A high-importance Goal in the same tag-neighborhood amplified the
     /// signal's effect on this Project. `factor` is the multiplier
     /// applied (e.g. 1.45 means a 45% boost over the base delta).
@@ -117,10 +115,9 @@ fn render_cause(c: &Cause) -> String {
             matched_tags.join(", "),
             confidence,
         ),
-        Cause::Decay { days_elapsed } => format!(
-            "Decay: {:.1} days since last relevant signal",
-            days_elapsed,
-        ),
+        Cause::Decay { days_elapsed } => {
+            format!("Decay: {:.1} days since last relevant signal", days_elapsed,)
+        }
         Cause::GoalAmplified {
             goal_name,
             importance,

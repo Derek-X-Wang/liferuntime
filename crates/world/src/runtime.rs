@@ -74,7 +74,8 @@ impl EventLogBackend {
     ) -> Result<StoredEvent<WorldEvent>, RuntimeError> {
         match self {
             Self::Memory(l) => {
-                l.append(stored.clone()).unwrap_or_else(|never| match never {});
+                l.append(stored.clone())
+                    .unwrap_or_else(|never| match never {});
             }
             Self::Jsonl(l) => {
                 l.append(stored.clone())?;
@@ -142,10 +143,7 @@ impl WorldRuntime {
         Ok(rt)
     }
 
-    fn with_backend(
-        log: EventLogBackend,
-        dir: Option<PathBuf>,
-    ) -> Result<Self, RuntimeError> {
+    fn with_backend(log: EventLogBackend, dir: Option<PathBuf>) -> Result<Self, RuntimeError> {
         let mut world = World::new();
         world.init_resource::<ChangeLog>();
         world.init_resource::<Now>();
@@ -225,9 +223,7 @@ impl WorldRuntime {
                     });
                 }
             }
-            WorldEvent::GoalCreated {
-                id, importance, ..
-            } => {
+            WorldEvent::GoalCreated { id, importance, .. } => {
                 if self.goal_exists(id) {
                     return Err(RuntimeError::DuplicateEntity {
                         kind: "Goal",
@@ -244,9 +240,7 @@ impl WorldRuntime {
                     });
                 }
             }
-            WorldEvent::GoalUpdated {
-                id, importance, ..
-            } => {
+            WorldEvent::GoalUpdated { id, importance, .. } => {
                 if !self.goal_exists(id) {
                     return Err(RuntimeError::EntityNotFound {
                         kind: "Goal",
@@ -333,11 +327,7 @@ impl WorldRuntime {
         let records = self.world.resource::<ChangeLog>().records.clone();
         let new_records: Vec<ChangeRecord> = records
             .into_iter()
-            .filter(|r| {
-                cursor_id
-                    .as_ref()
-                    .is_none_or(|c| r.triggered_by_event > *c)
-            })
+            .filter(|r| cursor_id.as_ref().is_none_or(|c| r.triggered_by_event > *c))
             .collect();
 
         if let Some(latest) = self.log.replay_all()?.iter().map(|e| e.id.clone()).max() {
@@ -386,10 +376,9 @@ impl WorldRuntime {
         let records = self.world.resource::<ChangeLog>().records.clone();
         let scoped: Vec<ChangeRecord> = match target {
             ExplainTarget::LatestChange => records,
-            ExplainTarget::Entity(id) => records
-                .into_iter()
-                .filter(|r| r.entity_id == id)
-                .collect(),
+            ExplainTarget::Entity(id) => {
+                records.into_iter().filter(|r| r.entity_id == id).collect()
+            }
         };
         Ok(Explanation { records: scoped })
     }
@@ -431,8 +420,9 @@ impl WorldRuntime {
             let mut per_entity_this_advance: HashMap<String, f32> = HashMap::new();
             for r in &adv.records {
                 if r.field == "strategic_relevance" {
-                    *per_entity_this_advance.entry(r.entity_id.clone()).or_insert(0.0) +=
-                        r.after - r.before;
+                    *per_entity_this_advance
+                        .entry(r.entity_id.clone())
+                        .or_insert(0.0) += r.after - r.before;
                 }
             }
             for (entity, delta) in per_entity_this_advance {
@@ -754,8 +744,14 @@ mod tests {
 
         let explanation = runtime.explain(ExplainTarget::LatestChange).unwrap();
         let rendered = explanation.to_string();
-        assert!(rendered.contains("tnt"), "explanation missing entity: {rendered}");
-        assert!(rendered.contains("voice"), "explanation missing tag: {rendered}");
+        assert!(
+            rendered.contains("tnt"),
+            "explanation missing entity: {rendered}"
+        );
+        assert!(
+            rendered.contains("voice"),
+            "explanation missing tag: {rendered}"
+        );
         assert!(
             rendered.contains("Realtime voice"),
             "explanation missing signal summary: {rendered}"
@@ -767,8 +763,14 @@ mod tests {
         let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let events: Vec<(WorldEvent, _)> = vec![
             (project("p1", &["ai", "voice"]), t0),
-            (signal("voice models improving", &["ai", "voice"], 0.7), t0 + Duration::hours(1)),
-            (signal("ai funding wave", &["ai"], 0.5), t0 + Duration::hours(2)),
+            (
+                signal("voice models improving", &["ai", "voice"], 0.7),
+                t0 + Duration::hours(1),
+            ),
+            (
+                signal("ai funding wave", &["ai"], 0.5),
+                t0 + Duration::hours(2),
+            ),
         ];
 
         let mut a = WorldRuntime::in_memory().unwrap();
@@ -797,25 +799,23 @@ mod tests {
     #[test]
     fn unmatched_signal_changes_nothing() {
         let mut runtime = WorldRuntime::in_memory().unwrap();
-        runtime
-            .ingest(project("tnt", &["ai", "voice"]))
-            .unwrap();
+        runtime.ingest(project("tnt", &["ai", "voice"])).unwrap();
         runtime
             .ingest(signal("random news", &["politics"], 0.9))
             .unwrap();
         let changes = runtime.advance().unwrap();
-        assert!(changes.is_empty(), "no project should match: {:?}", changes.records);
+        assert!(
+            changes.is_empty(),
+            "no project should match: {:?}",
+            changes.records
+        );
     }
 
     #[test]
     fn second_advance_with_no_new_events_is_empty() {
         let mut runtime = WorldRuntime::in_memory().unwrap();
-        runtime
-            .ingest(project("p1", &["ai"]))
-            .unwrap();
-        runtime
-            .ingest(signal("ai stuff", &["ai"], 0.5))
-            .unwrap();
+        runtime.ingest(project("p1", &["ai"])).unwrap();
+        runtime.ingest(signal("ai stuff", &["ai"], 0.5)).unwrap();
         let first = runtime.advance().unwrap();
         assert!(!first.is_empty());
         let second = runtime.advance().unwrap();
@@ -829,9 +829,7 @@ mod tests {
     #[test]
     fn inspect_reflects_derived_state_after_materialize() {
         let mut runtime = WorldRuntime::in_memory().unwrap();
-        runtime
-            .ingest(project("p1", &["ai", "voice"]))
-            .unwrap();
+        runtime.ingest(project("p1", &["ai", "voice"])).unwrap();
         runtime
             .ingest(signal("voice models", &["voice", "ai"], 0.9))
             .unwrap();
@@ -1082,7 +1080,10 @@ mod tests {
             .iter()
             .flat_map(|r| r.causes.iter())
             .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
-        assert!(rendered, "amplified change should carry a GoalAmplified cause");
+        assert!(
+            rendered,
+            "amplified change should carry a GoalAmplified cause"
+        );
     }
 
     #[test]
@@ -1091,7 +1092,13 @@ mod tests {
         rt.ingest(project("tnt", &["ai"])).unwrap();
         let result = rt.ingest(project("tnt", &["voice"]));
         assert!(
-            matches!(result, Err(RuntimeError::DuplicateEntity { kind: "Project", .. })),
+            matches!(
+                result,
+                Err(RuntimeError::DuplicateEntity {
+                    kind: "Project",
+                    ..
+                })
+            ),
             "expected DuplicateEntity error, got {result:?}"
         );
     }
@@ -1105,7 +1112,13 @@ mod tests {
             tags: None,
         });
         assert!(
-            matches!(result, Err(RuntimeError::EntityNotFound { kind: "Project", .. })),
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
             "expected EntityNotFound, got {result:?}"
         );
     }
@@ -1121,7 +1134,13 @@ mod tests {
             observed_at: None,
         });
         assert!(
-            matches!(result, Err(RuntimeError::ValueOutOfRange { field: "confidence", .. })),
+            matches!(
+                result,
+                Err(RuntimeError::ValueOutOfRange {
+                    field: "confidence",
+                    ..
+                })
+            ),
             "expected ValueOutOfRange, got {result:?}"
         );
     }
@@ -1143,19 +1162,33 @@ mod tests {
         let dir = tempfile_dir();
         {
             let mut rt = WorldRuntime::open_dir(&dir).unwrap();
-            rt.ingest_at(project("hot", &["ai"]), Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()).unwrap();
-            rt.ingest_at(signal("ai news", &["ai"], 1.0), Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap()).unwrap();
+            rt.ingest_at(
+                project("hot", &["ai"]),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
+            rt.ingest_at(
+                signal("ai news", &["ai"], 1.0),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
+            )
+            .unwrap();
             rt.advance().unwrap(); // first advance: bump
             rt.ingest_at(
-                WorldEvent::TimePulseObserved { observed_at: Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap() },
+                WorldEvent::TimePulseObserved {
+                    observed_at: Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
+                },
                 Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             rt.advance().unwrap(); // second advance: decay
         }
 
         let mut rt = WorldRuntime::open_dir(&dir).unwrap();
         let trajectories = rt.trajectories(5).unwrap();
-        let hot = trajectories.iter().find(|t| t.id == "hot").expect("project visible");
+        let hot = trajectories
+            .iter()
+            .find(|t| t.id == "hot")
+            .expect("project visible");
         // Most recent advance was the decay; slope should be negative.
         assert!(
             hot.slope_relevance < 0.0,
@@ -1203,21 +1236,15 @@ mod tests {
         {
             let mut rt = WorldRuntime::open_dir(&dir).unwrap();
             rt.ingest(project("tnt", &["ai"])).unwrap();
-            rt.ingest_with_key(
-                signal("ai news", &["ai"], 0.6),
-                Some("kron-job-42".into()),
-            )
-            .unwrap();
+            rt.ingest_with_key(signal("ai news", &["ai"], 0.6), Some("kron-job-42".into()))
+                .unwrap();
         }
 
         // Second "CLI invocation" with the same key should be a no-op.
         let mut rt = WorldRuntime::open_dir(&dir).unwrap();
         let before_advance = rt.event_count();
-        rt.ingest_with_key(
-            signal("ai news", &["ai"], 0.6),
-            Some("kron-job-42".into()),
-        )
-        .unwrap();
+        rt.ingest_with_key(signal("ai news", &["ai"], 0.6), Some("kron-job-42".into()))
+            .unwrap();
         let after_advance = rt.event_count();
         assert_eq!(
             before_advance, after_advance,
@@ -1248,9 +1275,7 @@ mod tests {
     #[test]
     fn achieved_goal_no_longer_amplifies_matching() {
         let mut runtime = WorldRuntime::in_memory().unwrap();
-        runtime
-            .ingest(project("tnt", &["ai", "voice"]))
-            .unwrap();
+        runtime.ingest(project("tnt", &["ai", "voice"])).unwrap();
         runtime
             .ingest(WorldEvent::GoalCreated {
                 id: "g1".into(),
@@ -1301,9 +1326,7 @@ mod tests {
         let mut runtime = WorldRuntime::in_memory().unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
-        runtime
-            .ingest_at(project("p1", &["ai"]), t0)
-            .unwrap();
+        runtime.ingest_at(project("p1", &["ai"]), t0).unwrap();
         runtime
             .ingest_at(
                 signal("strong ai signal", &["ai"], 1.0),

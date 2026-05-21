@@ -98,9 +98,9 @@ pub fn signal_project_matching_system(
                 causes,
             });
 
-            commands
-                .entity(project_entity)
-                .insert(LastTouched { at: signal.observed_at });
+            commands.entity(project_entity).insert(LastTouched {
+                at: signal.observed_at,
+            });
         }
         // Transient signals: the entity exists only for matching. After
         // processing, despawn — the canonical signal history is in the
@@ -112,10 +112,7 @@ pub fn signal_project_matching_system(
 /// Compute the goal-amplification factor for a Signal: `1 + 0.5 *
 /// max(importance)` over Goals whose tags overlap the signal's tags. If
 /// no Goal overlaps, factor = 1.0 and no cause is produced.
-fn goal_amplifier(
-    goals: &[(Identity, Goal)],
-    signal_tags: &[String],
-) -> (f32, Option<Cause>) {
+fn goal_amplifier(goals: &[(Identity, Goal)], signal_tags: &[String]) -> (f32, Option<Cause>) {
     let mut best: Option<(&Identity, &Goal)> = None;
     for (id, goal) in goals {
         // Only Active goals amplify. Achieved / Abandoned goals are
@@ -123,8 +120,7 @@ fn goal_amplifier(
         if goal.status != GoalStatus::Active {
             continue;
         }
-        let signal_canonical: Vec<String> =
-            signal_tags.iter().map(|t| canonical_tag(t)).collect();
+        let signal_canonical: Vec<String> = signal_tags.iter().map(|t| canonical_tag(t)).collect();
         let overlap = goal
             .tags
             .iter()

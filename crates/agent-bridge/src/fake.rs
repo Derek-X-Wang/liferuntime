@@ -11,10 +11,7 @@ pub struct FakeAgent;
 impl AgentBridge for FakeAgent {
     type Error = Infallible;
 
-    fn analyze_signal(
-        &self,
-        input: SignalAnalysisInput,
-    ) -> Result<Vec<ProposedEvent>, Infallible> {
+    fn analyze_signal(&self, input: SignalAnalysisInput) -> Result<Vec<ProposedEvent>, Infallible> {
         let lower = input.text.to_lowercase();
         let mut tags: Vec<String> = ["ai", "voice", "agent", "finance", "health"]
             .iter()

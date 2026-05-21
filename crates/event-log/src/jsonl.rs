@@ -138,10 +138,8 @@ fn write_header(path: &Path) -> Result<(), JsonlError> {
         meta: SCHEMA_MARKER.into(),
         version: SCHEMA_VERSION,
     };
-    let line = serde_json::to_string(&header).map_err(|source| JsonlError::Json {
-        line: 1,
-        source,
-    })?;
+    let line =
+        serde_json::to_string(&header).map_err(|source| JsonlError::Json { line: 1, source })?;
     writeln!(file, "{line}").map_err(|source| JsonlError::Io {
         path: path.to_path_buf(),
         source,

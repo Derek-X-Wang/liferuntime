@@ -24,8 +24,6 @@ pub struct SignalAnalysisInput {
 pub trait AgentBridge {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn analyze_signal(
-        &self,
-        input: SignalAnalysisInput,
-    ) -> Result<Vec<ProposedEvent>, Self::Error>;
+    fn analyze_signal(&self, input: SignalAnalysisInput)
+        -> Result<Vec<ProposedEvent>, Self::Error>;
 }

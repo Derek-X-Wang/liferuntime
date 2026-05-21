@@ -108,9 +108,7 @@ enum ProjectCmd {
         note: Option<String>,
     },
     /// Move an Archived or Completed project back to Active.
-    Reactivate {
-        id: String,
-    },
+    Reactivate { id: String },
 }
 
 #[derive(Subcommand)]
@@ -147,9 +145,7 @@ enum GoalCmd {
         reason: Option<String>,
     },
     /// Move an Achieved or Abandoned goal back to Active.
-    Reactivate {
-        id: String,
-    },
+    Reactivate { id: String },
 }
 
 #[derive(Subcommand)]
@@ -219,8 +215,10 @@ fn eprint_friendly(err: &anyhow::Error) {
     // common cases without leaking types.
     let msg = format!("{err}");
     if msg.contains("already exists") {
-        eprintln!("  hint: use the `edit` subcommand to modify the existing entity, \
-                   or pick a different id.");
+        eprintln!(
+            "  hint: use the `edit` subcommand to modify the existing entity, \
+                   or pick a different id."
+        );
     } else if msg.contains("not found") {
         eprintln!("  hint: list entities with `liferuntime status` or `liferuntime inspect`.");
     } else if msg.contains("out of range") {
@@ -348,10 +346,7 @@ fn run() -> Result<()> {
             commit,
             idempotency_key,
         }) => {
-            let proposals = FakeAgent.analyze_signal(SignalAnalysisInput {
-                text,
-                hints: tags,
-            })?;
+            let proposals = FakeAgent.analyze_signal(SignalAnalysisInput { text, hints: tags })?;
             if proposals.is_empty() {
                 println!("Agent proposed no events.");
             } else {
@@ -416,7 +411,11 @@ fn run() -> Result<()> {
         }
         Command::Replay => {
             let rt = WorldRuntime::open_dir(&cli.dir)?;
-            println!("Replayed {} events from {}.", rt.event_count(), cli.dir.display());
+            println!(
+                "Replayed {} events from {}.",
+                rt.event_count(),
+                cli.dir.display()
+            );
         }
         Command::Status { window } => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
@@ -440,12 +439,10 @@ fn run() -> Result<()> {
 }
 
 fn cmd_init(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let events = dir.join("events.jsonl");
     if !events.exists() {
-        std::fs::File::create(&events)
-            .with_context(|| format!("creating {}", events.display()))?;
+        std::fs::File::create(&events).with_context(|| format!("creating {}", events.display()))?;
     }
     println!("Initialized liferuntime at {}", dir.display());
     Ok(())
@@ -498,7 +495,11 @@ fn print_status(views: &[ProjectTrajectoryView], window: usize) {
         return;
     }
 
-    println!("Active projects ({}, trajectory over last {} advance(s)):", active.len(), window);
+    println!(
+        "Active projects ({}, trajectory over last {} advance(s)):",
+        active.len(),
+        window
+    );
     for v in &active {
         let arrow = if v.advances_observed == 0 {
             "·"
@@ -517,12 +518,7 @@ fn print_status(views: &[ProjectTrajectoryView], window: usize) {
         };
         println!(
             "  {} {:24}  relevance {:.2}  urgency {:.2}  slope {:+.3} ({})",
-            arrow,
-            v.name,
-            v.current_relevance,
-            v.current_urgency,
-            v.slope_relevance,
-            label,
+            arrow, v.name, v.current_relevance, v.current_urgency, v.slope_relevance, label,
         );
     }
 }
@@ -530,7 +526,12 @@ fn print_status(views: &[ProjectTrajectoryView], window: usize) {
 fn print_proposals(proposals: &[ProposedEvent]) {
     println!("Proposed by agent:");
     for (i, p) in proposals.iter().enumerate() {
-        println!("  [{}] {} (confidence {:.2})", i + 1, p.summary, p.confidence);
+        println!(
+            "  [{}] {} (confidence {:.2})",
+            i + 1,
+            p.summary,
+            p.confidence
+        );
         if !p.tags.is_empty() {
             println!("       tags: [{}]", p.tags.join(", "));
         }
@@ -543,8 +544,7 @@ fn print_proposals(proposals: &[ProposedEvent]) {
 fn save_last_advance(dir: &Path, e: &Explanation) -> Result<()> {
     let path = dir.join("last_advance.json");
     let bytes = serde_json::to_vec_pretty(e)?;
-    std::fs::write(&path, bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -553,7 +553,6 @@ fn load_last_advance(dir: &Path) -> Result<Option<Explanation>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
