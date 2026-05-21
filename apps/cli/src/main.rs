@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
 use liferuntime_event_log::EventId;
 use liferuntime_world::{
-    DecisionStance, Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView, WorldChanges,
-    WorldEvent, WorldRuntime,
+    format_decision_list, Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView,
+    WorldChanges, WorldEvent, WorldRuntime,
 };
 use std::path::{Path, PathBuf};
 
@@ -501,8 +501,15 @@ fn run() -> Result<()> {
         }
         Command::Decision(DecisionCmd::List) => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
-            let stances = rt.decision_stances();
-            print_decision_stances(&stances);
+            let views = rt.decision_list()?;
+            if views.is_empty() {
+                println!("No active decisions.");
+            } else {
+                // `format_decision_list` always ends with a newline so
+                // we use `print!` rather than `println!` to avoid an
+                // extra blank line at the end.
+                print!("{}", format_decision_list(&views));
+            }
         }
         Command::Decision(DecisionCmd::Revoke { decision_id }) => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
@@ -513,22 +520,6 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn print_decision_stances(stances: &std::collections::HashMap<String, DecisionStance>) {
-    if stances.is_empty() {
-        println!("No active decisions.");
-        return;
-    }
-    let mut rows: Vec<(&String, &DecisionStance)> = stances.iter().collect();
-    rows.sort_by(|a, b| a.0.cmp(b.0));
-    for (project_id, stance) in rows {
-        let (verb, decision_id) = match stance {
-            DecisionStance::Chosen { decision_id } => ("chosen", decision_id),
-            DecisionStance::Dampened { decision_id } => ("dampened", decision_id),
-        };
-        println!("{project_id}: {verb} by {decision_id}");
-    }
 }
 
 fn cmd_init(dir: &Path) -> Result<()> {
