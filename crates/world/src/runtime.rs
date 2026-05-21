@@ -13,8 +13,8 @@ use crate::errors::RuntimeError;
 use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
 use crate::model::{
-    DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, PendingDecision,
-    Project, ProjectStatus, RecordedDecisions, Signal, Unprocessed,
+    DecisionBoost, DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now,
+    PendingDecision, Project, ProjectStatus, RecordedDecisions, Signal, Unprocessed,
 };
 use crate::queries::{ProjectTrajectoryView, ProjectView};
 use crate::systems::register_systems;
@@ -411,14 +411,20 @@ impl WorldRuntime {
     }
 
     pub fn inspect_project(&mut self, id: &str) -> Option<ProjectView> {
-        let mut q = self.world.query::<(&Identity, &Project)>();
-        for (ident, project) in q.iter(&self.world) {
+        let mut q = self
+            .world
+            .query::<(&Identity, &Project, Option<&DecisionBoost>)>();
+        for (ident, project, boost) in q.iter(&self.world) {
             if ident.0 == id {
+                let raw = project.strategic_relevance;
+                let boost_contrib = boost.map(|b| b.remaining).unwrap_or(0.0);
+                let visible = (raw + boost_contrib).clamp(0.0, 1.0);
                 return Some(ProjectView {
                     id: ident.0.clone(),
                     name: project.name.clone(),
                     tags: project.tags.clone(),
-                    strategic_relevance: project.strategic_relevance,
+                    strategic_relevance_raw: raw,
+                    strategic_relevance_visible: visible,
                     urgency: project.urgency,
                     status: project.status,
                     archived_reason: project.archived_reason.clone(),
@@ -774,7 +780,9 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 })
                 .collect();
             for entity in to_clear {
-                world.entity_mut(entity).remove::<DecisionStance>();
+                let mut em = world.entity_mut(entity);
+                em.remove::<DecisionStance>();
+                em.remove::<DecisionBoost>();
             }
         }
     }
@@ -950,9 +958,9 @@ mod tests {
         // derived — no explicit materialize step needed.
         let view = runtime.inspect_project("p1").expect("project exists");
         assert!(
-            view.strategic_relevance > 0.5,
+            view.strategic_relevance_visible > 0.5,
             "expected strategic_relevance > 0.5 after matching signal, got {}",
-            view.strategic_relevance
+            view.strategic_relevance_visible
         );
     }
 
@@ -986,7 +994,7 @@ mod tests {
         let vb = b.inspect_project("tnt").unwrap();
         assert_eq!(va.name, "TNT (voice agent)");
         assert_eq!(va.tags, vec!["ai", "voice"]);
-        assert!((va.strategic_relevance - vb.strategic_relevance).abs() < 1e-6);
+        assert!((va.strategic_relevance_visible - vb.strategic_relevance_visible).abs() < 1e-6);
     }
 
     #[test]
@@ -1030,9 +1038,9 @@ mod tests {
         let view = rt.inspect_project("tnt").expect("project exists");
         assert_eq!(view.status, ProjectStatus::Archived);
         assert!(
-            view.strategic_relevance > 0.5,
+            view.strategic_relevance_visible > 0.5,
             "signal arrived before archive — relevance should be > 0.5, got {}",
-            view.strategic_relevance
+            view.strategic_relevance_visible
         );
     }
 
@@ -1081,9 +1089,9 @@ mod tests {
         let view = runtime.inspect_project("p1").expect("project exists");
         assert_eq!(view.status, ProjectStatus::Archived);
         assert!(
-            view.strategic_relevance > 0.5,
+            view.strategic_relevance_visible > 0.5,
             "signal that arrived before archive should still have bumped relevance, got {}",
-            view.strategic_relevance
+            view.strategic_relevance_visible
         );
     }
 
@@ -1136,9 +1144,9 @@ mod tests {
         assert_eq!(view.status, ProjectStatus::Archived);
         assert_eq!(view.archived_reason.as_deref(), Some("paused"));
         assert!(
-            (view.strategic_relevance - 0.5).abs() < 1e-6,
+            (view.strategic_relevance_visible - 0.5).abs() < 1e-6,
             "archived project should remain at default 0.5, got {}",
-            view.strategic_relevance
+            view.strategic_relevance_visible
         );
     }
 
@@ -1529,7 +1537,11 @@ mod tests {
     // dampening.
 
     #[test]
-    fn decision_recorded_does_not_change_derived_state() {
+    fn decision_recorded_does_not_change_raw_relevance() {
+        // ADR-0008 #chosen-decaying-boost-not-a-floor: a Decision adds
+        // an additive boost on *visible* relevance, never touches the
+        // raw field. This pins the raw-immutability invariant; the
+        // visible-side effect is covered by the issue #4 boost tests.
         let mut runtime = WorldRuntime::in_memory().unwrap();
         runtime.ingest(project("tnt", &["ai"])).unwrap();
         let before = runtime.inspect_project("tnt").expect("project exists");
@@ -1546,10 +1558,10 @@ mod tests {
             .inspect_project("tnt")
             .expect("project still exists");
         assert!(
-            (before.strategic_relevance - after.strategic_relevance).abs() < 1e-6,
-            "tracer slice should not move strategic_relevance: {} → {}",
-            before.strategic_relevance,
-            after.strategic_relevance
+            (before.strategic_relevance_raw - after.strategic_relevance_raw).abs() < 1e-6,
+            "raw relevance must not move on Decision: {} → {}",
+            before.strategic_relevance_raw,
+            after.strategic_relevance_raw,
         );
         assert!((before.urgency - after.urgency).abs() < 1e-6);
         assert_eq!(before.status, after.status);
@@ -1659,12 +1671,16 @@ mod tests {
         );
         let tnt = rt.inspect_project("tnt").expect("tnt persisted");
         let side = rt.inspect_project("side-x").expect("side-x persisted");
+        // Raw relevance is untouched by Decisions (boost is an additive
+        // layer surfaced through `_visible`; per ADR-0008). Issue #4
+        // adds the boost; this assertion now pins the additive-only
+        // invariant rather than "Decision changes nothing."
         assert!(
-            (tnt.strategic_relevance - 0.5).abs() < 1e-6,
-            "tracer slice must not move strategic_relevance: {}",
-            tnt.strategic_relevance
+            (tnt.strategic_relevance_raw - 0.5).abs() < 1e-6,
+            "raw relevance unchanged by Decision: {}",
+            tnt.strategic_relevance_raw
         );
-        assert!((side.strategic_relevance - 0.5).abs() < 1e-6);
+        assert!((side.strategic_relevance_raw - 0.5).abs() < 1e-6);
     }
 
     // -------- Decision: per-project stance derivation (issue #2) --------
@@ -2068,9 +2084,249 @@ mod tests {
         let mut rt = WorldRuntime::open_dir(&dir).unwrap();
         let tnt = rt.inspect_project("tnt").expect("project exists");
         assert!(
-            tnt.strategic_relevance > 0.5,
+            tnt.strategic_relevance_visible > 0.5,
             "existing matching behavior must survive the additive variant addition, got {}",
-            tnt.strategic_relevance
+            tnt.strategic_relevance_visible
+        );
+    }
+
+    // -------- Decision: Chosen — decaying boost + ProjectView raw/visible split (issue #4) --------
+
+    #[test]
+    fn decision_chose_applies_initial_boost_of_0_15_to_visible_relevance() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let before = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (before.strategic_relevance_visible - before.strategic_relevance_raw).abs() < 1e-6,
+            "with no boost, visible should equal raw"
+        );
+
+        rt.ingest(WorldEvent::DecisionRecorded {
+            chose: "tnt".into(),
+            over: vec![],
+            dampen: vec![],
+            reason: None,
+            decided_at: None,
+        })
+        .unwrap();
+
+        let after = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (after.strategic_relevance_raw - before.strategic_relevance_raw).abs() < 1e-6,
+            "raw must NOT change on Decision: before={} after={}",
+            before.strategic_relevance_raw,
+            after.strategic_relevance_raw,
+        );
+        assert!(
+            (after.strategic_relevance_visible - (before.strategic_relevance_raw + 0.15)).abs()
+                < 1e-4,
+            "visible should be raw + 0.15 boost, got visible={} (raw={})",
+            after.strategic_relevance_visible,
+            after.strategic_relevance_raw,
+        );
+    }
+
+    #[test]
+    fn decision_boost_decays_over_event_log_days() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        rt.ingest_at(
+            WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: Some(t0),
+            },
+            t0,
+        )
+        .unwrap();
+
+        let immediately_after = rt.inspect_project("tnt").unwrap();
+        let visible_at_apply = immediately_after.strategic_relevance_visible;
+
+        // Advance event-log time 30 days via a TimePulse (ADR-0004).
+        rt.ingest_at(
+            WorldEvent::TimePulseObserved {
+                observed_at: t0 + Duration::days(30),
+            },
+            t0 + Duration::days(30),
+        )
+        .unwrap();
+
+        let after_decay = rt.inspect_project("tnt").unwrap();
+        let visible_after_decay = after_decay.strategic_relevance_visible;
+
+        assert!(
+            visible_after_decay < visible_at_apply,
+            "boost should monotonically decay toward 0 (0.999/day): visible_at_apply={visible_at_apply} after_30d={visible_after_decay}",
+        );
+        // 0.999^30 ≈ 0.9704. Initial boost 0.15 → ≈ 0.1456 remaining.
+        // Visible erosion should be ≈ 0.0044 — well above any noise floor.
+        let erosion = visible_at_apply - visible_after_decay;
+        assert!(
+            erosion > 0.001,
+            "expected ≥0.001 erosion after 30 days, got {erosion}"
+        );
+        // Raw stays put.
+        assert!(
+            (after_decay.strategic_relevance_raw - immediately_after.strategic_relevance_raw).abs()
+                < 1e-6,
+            "raw must not change under decay of boost"
+        );
+    }
+
+    #[test]
+    fn decision_boost_emits_decision_boost_applied_cause_on_apply() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        let dec = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t0),
+                },
+                t0,
+            )
+            .unwrap();
+
+        let changes = rt.advance().unwrap();
+        let cited = changes.records.iter().any(|r| {
+            r.entity_id == "tnt"
+                && r.field == "strategic_relevance"
+                && r.causes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::Cause::DecisionBoostApplied { decision_id, .. }
+                            if decision_id == &dec.event_id
+                    )
+                })
+        });
+        assert!(
+            cited,
+            "initial boost should emit a DecisionBoostApplied cause citing decision id: {:#?}",
+            changes.records,
+        );
+    }
+
+    #[test]
+    fn decision_boost_emits_decision_boost_applied_cause_on_decay() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        let dec = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t0),
+                },
+                t0,
+            )
+            .unwrap();
+        rt.advance().unwrap();
+
+        rt.ingest_at(
+            WorldEvent::TimePulseObserved {
+                observed_at: t0 + Duration::days(30),
+            },
+            t0 + Duration::days(30),
+        )
+        .unwrap();
+        let after = rt.advance().unwrap();
+        let cited = after.records.iter().any(|r| {
+            r.entity_id == "tnt"
+                && r.causes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::Cause::DecisionBoostApplied { decision_id, .. }
+                            if decision_id == &dec.event_id
+                    )
+                })
+        });
+        assert!(
+            cited,
+            "decay should emit a DecisionBoostApplied cause: {:#?}",
+            after.records,
+        );
+    }
+
+    #[test]
+    fn visible_relevance_clamps_to_1_when_raw_plus_boost_exceeds_1() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("p", &["ai"])).unwrap();
+        rt.ingest(WorldEvent::GoalCreated {
+            id: "g".into(),
+            name: "g".into(),
+            tags: vec!["ai".into()],
+            importance: 1.0,
+        })
+        .unwrap();
+        // Several strong signals to push raw close to 1.0.
+        for _ in 0..30 {
+            rt.ingest(signal("ai surge", &["ai"], 1.0)).unwrap();
+        }
+        let after_signals = rt.inspect_project("p").unwrap();
+        assert!(
+            after_signals.strategic_relevance_raw > 0.95,
+            "raw should approach 1.0 after sustained signals, got {}",
+            after_signals.strategic_relevance_raw
+        );
+
+        rt.ingest(WorldEvent::DecisionRecorded {
+            chose: "p".into(),
+            over: vec![],
+            dampen: vec![],
+            reason: None,
+            decided_at: None,
+        })
+        .unwrap();
+
+        let after_boost = rt.inspect_project("p").unwrap();
+        assert!(
+            after_boost.strategic_relevance_visible <= 1.0 + 1e-6,
+            "visible must clamp to 1.0, got {}",
+            after_boost.strategic_relevance_visible,
+        );
+        assert!(
+            after_boost.strategic_relevance_visible >= after_boost.strategic_relevance_raw - 1e-6,
+            "visible (clamped) should not drop below raw (raw={}, visible={})",
+            after_boost.strategic_relevance_raw,
+            after_boost.strategic_relevance_visible,
+        );
+    }
+
+    #[test]
+    fn explain_project_cites_decision_by_id_when_boost_contributed() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        let dec = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t0),
+                },
+                t0,
+            )
+            .unwrap();
+        let explanation = rt.explain(ExplainTarget::Entity("tnt".into())).unwrap();
+        let rendered = explanation.to_string();
+        assert!(
+            rendered.contains(dec.event_id.as_str()),
+            "explanation should cite decision id {}, got:\n{rendered}",
+            dec.event_id,
         );
     }
 }

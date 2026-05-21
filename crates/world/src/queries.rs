@@ -7,7 +7,15 @@ pub struct ProjectView {
     pub id: String,
     pub name: String,
     pub tags: Vec<String>,
-    pub strategic_relevance: f32,
+    /// Raw `strategic_relevance` — mutated only by matching and decay.
+    /// Decisions never touch this field; their boost is an additive
+    /// layer surfaced via [`Self::strategic_relevance_visible`] per
+    /// ADR-0008 `#chosen-decaying-boost-not-a-floor`.
+    pub strategic_relevance_raw: f32,
+    /// User-facing `strategic_relevance` — `raw + active Decision boost`,
+    /// clamped to `[0.0, 1.0]`. Equal to `_raw` when no Decision
+    /// steers this project.
+    pub strategic_relevance_visible: f32,
     pub urgency: f32,
     pub status: ProjectStatus,
     pub archived_reason: Option<String>,
