@@ -23,6 +23,10 @@ pub struct ProjectView {
     pub status: ProjectStatus,
     pub archived_reason: Option<String>,
     pub completion_note: Option<String>,
+    /// Light declarative annotation (CONTEXT.md `#depends_on`). Renderers
+    /// surface the list verbatim — no traversal, no system effects.
+    /// Cycles are permitted; the field is always rendered flat.
+    pub depends_on: Vec<String>,
 }
 
 /// One entry in the output of [`crate::WorldRuntime::trajectories`]:

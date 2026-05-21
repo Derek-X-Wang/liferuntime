@@ -136,12 +136,17 @@ enum ProjectCmd {
     },
     /// Edit an existing project. Only provided fields are updated.
     /// `--tags` replaces the project's tag list (use the full new list).
+    /// `--depends-on` replaces the project's dependency annotation list
+    /// (CONTEXT.md `#depends_on`); same full-replace ergonomics as
+    /// `--tags`.
     Edit {
         id: String,
         #[arg(long)]
         name: Option<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        #[arg(long = "depends-on", value_delimiter = ',')]
+        depends_on: Option<Vec<String>>,
     },
     /// Soft-shelve a project. Systems skip it; reactivate to un-do.
     Archive {
@@ -287,12 +292,18 @@ fn run() -> Result<()> {
             })?;
             println!("Project added: {id}");
         }
-        Command::Project(ProjectCmd::Edit { id, name, tags }) => {
+        Command::Project(ProjectCmd::Edit {
+            id,
+            name,
+            tags,
+            depends_on,
+        }) => {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
             rt.ingest(WorldEvent::ProjectUpdated {
                 id: id.clone(),
                 name,
                 tags,
+                depends_on,
             })?;
             println!("Project updated: {id}");
         }
@@ -559,6 +570,11 @@ fn print_project(p: &ProjectView) {
     };
     println!("Project: {} ({}) [{}]", p.name, p.id, status_label);
     println!("Tags: [{}]", p.tags.join(", "));
+    // Per CONTEXT.md `#depends_on`: declarative annotation surfaced in
+    // `inspect` only. Empty list ⇒ omit the line.
+    if !p.depends_on.is_empty() {
+        println!("Depends on: [{}]", p.depends_on.join(", "));
+    }
     println!(
         "  strategic_relevance: raw {:.2}  visible {:.2}",
         p.strategic_relevance_raw, p.strategic_relevance_visible,
