@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
+use liferuntime_event_log::EventId;
 use liferuntime_world::{
     DecisionStance, Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView, WorldChanges,
     WorldEvent, WorldRuntime,
@@ -115,6 +116,13 @@ enum DecisionCmd {
     /// with boost remaining, decided-on date, and partial supersession
     /// lands in issue #7.
     List,
+    /// Revoke a previously-recorded Decision by its event id (ADR-0008
+    /// `#lifecycle`). Every Project whose stance is still owned by the
+    /// revoked Decision reverts to no-stance.
+    Revoke {
+        /// Event id of the `DecisionRecorded` to revoke.
+        decision_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -495,6 +503,13 @@ fn run() -> Result<()> {
             let mut rt = WorldRuntime::open_dir(&cli.dir)?;
             let stances = rt.decision_stances();
             print_decision_stances(&stances);
+        }
+        Command::Decision(DecisionCmd::Revoke { decision_id }) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::DecisionRevoked {
+                decision_id: EventId(decision_id.clone()),
+            })?;
+            println!("Decision revoked: {decision_id}");
         }
     }
     Ok(())
