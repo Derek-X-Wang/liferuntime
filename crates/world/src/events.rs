@@ -120,6 +120,24 @@ pub enum WorldEvent {
         #[serde(default)]
         decided_at: Option<DateTime<Utc>>,
     },
+    /// Revoke a previously-recorded Decision (ADR-0008
+    /// `#lifecycle`).
+    ///
+    /// `decision_id` references a `DecisionRecorded` event id. Ingest
+    /// rejects unknown ids loudly (the user is asking the system to
+    /// revoke nothing). Replay, by contrast, silently ignores an
+    /// orphan revoke — consistent with the existing replay tolerance
+    /// for impossible updates in `apply_event`, and required for any
+    /// hand-corrupted log to keep loading.
+    ///
+    /// On apply, every Project whose current `DecisionStance` is owned
+    /// by `decision_id` is cleared. Projects that were originally
+    /// steered by this Decision but have since been superseded by a
+    /// later one are unaffected — their stance is owned by the later
+    /// Decision.
+    DecisionRevoked {
+        decision_id: liferuntime_event_log::EventId,
+    },
 }
 
 fn default_importance() -> f32 {

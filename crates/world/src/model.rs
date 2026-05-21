@@ -204,3 +204,26 @@ pub struct PendingDecision {
     pub chose: String,
     pub dampen: Vec<String>,
 }
+
+/// Set of decision_ids that have been observed in `DecisionRecorded`
+/// events during the lifetime of this runtime. Rebuilt by replay from
+/// the event log.
+///
+/// Two consumers:
+///   1. `validate_event` for `DecisionRevoked` — reject loudly at
+///      ingest if the referenced id was never recorded.
+///   2. `apply_event` for `DecisionRevoked` — silently no-op if the
+///      id is unknown (replay tolerance for a corrupted log; see
+///      ADR-0008 `#lifecycle` amendment).
+#[derive(Resource, Default, Clone, Debug)]
+pub struct RecordedDecisions(pub std::collections::HashSet<EventId>);
+
+impl RecordedDecisions {
+    pub fn contains(&self, id: &EventId) -> bool {
+        self.0.contains(id)
+    }
+
+    pub fn insert(&mut self, id: EventId) {
+        self.0.insert(id);
+    }
+}

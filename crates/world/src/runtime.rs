@@ -14,7 +14,7 @@ use crate::events::WorldEvent;
 use crate::explanation::{ChangeLog, ChangeRecord, ExplainTarget, Explanation};
 use crate::model::{
     DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, PendingDecision,
-    Project, ProjectStatus, Signal, Unprocessed,
+    Project, ProjectStatus, RecordedDecisions, Signal, Unprocessed,
 };
 use crate::queries::{ProjectTrajectoryView, ProjectView};
 use crate::systems::register_systems;
@@ -148,6 +148,7 @@ impl WorldRuntime {
         world.init_resource::<ChangeLog>();
         world.init_resource::<Now>();
         world.init_resource::<LatestEventId>();
+        world.init_resource::<RecordedDecisions>();
 
         let mut schedule = Schedule::default();
         register_systems(&mut schedule);
@@ -299,6 +300,19 @@ impl WorldRuntime {
                             id: id.clone(),
                         });
                     }
+                }
+            }
+            WorldEvent::DecisionRevoked { decision_id } => {
+                // ADR-0008 `#lifecycle` (amended): ingest rejects
+                // unknown ids loudly; replay silently ignores them.
+                // The asymmetry lives here — `validate_event` runs at
+                // ingest, never during replay.
+                let recorded = self.world.resource::<RecordedDecisions>();
+                if !recorded.contains(decision_id) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Decision",
+                        id: decision_id.0.clone(),
+                    });
                 }
             }
         }
@@ -725,6 +739,43 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 chose: chose.clone(),
                 dampen: dampen.clone(),
             });
+            // Remember this decision_id so future DecisionRevoked
+            // events can validate at ingest and silently no-op at
+            // replay (issue #3).
+            world
+                .resource_mut::<RecordedDecisions>()
+                .insert(stored.id.clone());
+        }
+        WorldEvent::DecisionRevoked { decision_id } => {
+            // Replay tolerance (ADR-0008 `#lifecycle` amendment):
+            // silently ignore a revoke whose target was never
+            // recorded. At ingest, `validate_event` already rejected
+            // this payload — only a hand-corrupted log can reach this
+            // branch with an unknown id.
+            let known = world.resource::<RecordedDecisions>().contains(decision_id);
+            if !known {
+                return;
+            }
+
+            // Clear every project whose current stance is owned by the
+            // revoked Decision. Projects that were originally steered
+            // by this Decision but have since been superseded by a
+            // later one are unaffected — their stance is owned by the
+            // later Decision.
+            let mut q = world.query::<(Entity, &DecisionStance)>();
+            let to_clear: Vec<Entity> = q
+                .iter(world)
+                .filter_map(|(entity, stance)| {
+                    if stance.decision_id() == decision_id {
+                        Some(entity)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for entity in to_clear {
+                world.entity_mut(entity).remove::<DecisionStance>();
+            }
         }
     }
 }
@@ -1816,6 +1867,182 @@ mod tests {
             }
             other => panic!("expected Chosen after replay, got {other:?}"),
         }
+    }
+
+    // -------- Decision: revocation (issue #3) --------
+
+    #[test]
+    fn decision_revoke_clears_stances_owned_by_that_decision() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+
+        let dec = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let pre = rt.decision_stances();
+        assert!(pre.contains_key("tnt") && pre.contains_key("side-x"));
+
+        rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: dec.event_id.clone(),
+        })
+        .unwrap();
+
+        let post = rt.decision_stances();
+        assert!(
+            post.is_empty(),
+            "revoke should clear every project this Decision steered: {post:?}",
+        );
+    }
+
+    #[test]
+    fn decision_revoke_partial_only_clears_projects_still_owned_by_that_decision() {
+        // A steers tnt + dampens side-x. B then takes over tnt.
+        // After A+B: tnt=Chosen{B}, side-x=Dampened{A}.
+        // Revoke A → tnt unchanged (still B), side-x cleared.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+
+        let dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: dec_a.event_id.clone(),
+        })
+        .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            }),
+            "tnt should remain steered by B (A no longer owned it)",
+        );
+        assert!(
+            !stances.contains_key("side-x"),
+            "side-x's Dampened{{A}} should be cleared by A's revoke: {stances:?}",
+        );
+    }
+
+    #[test]
+    fn decision_revoke_orphan_id_is_rejected_at_ingest() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let before = rt.event_count();
+        let result = rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: EventId("never-recorded".into()),
+        });
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Decision",
+                    ..
+                })
+            ),
+            "expected EntityNotFound for orphan revoke, got {result:?}",
+        );
+        assert_eq!(
+            rt.event_count(),
+            before,
+            "rejection must not append to the log"
+        );
+    }
+
+    #[test]
+    fn decision_revoke_orphan_in_corrupted_log_is_silently_ignored_on_replay() {
+        // ADR-0008 (amended): replay silently tolerates an orphan
+        // DecisionRevoked. Manually append a revoke for a never-recorded
+        // decision id and re-open.
+        let dir = tempfile_dir();
+        {
+            let _rt = WorldRuntime::open_dir(&dir).unwrap();
+        }
+
+        let path = dir.join("events.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let bogus = StoredEvent {
+            id: EventId::new(),
+            occurred_at: Utc::now(),
+            idempotency_key: None,
+            payload: WorldEvent::DecisionRevoked {
+                decision_id: EventId("01HZNEVERRECORDED0000000000".into()),
+            },
+        };
+        std::io::Write::write_all(
+            &mut f,
+            format!("{}\n", serde_json::to_string(&bogus).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let stances = rt.decision_stances();
+        assert!(stances.is_empty());
+    }
+
+    #[test]
+    fn decision_revoke_then_record_new_decision_resteers_cleanly() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: dec_a.event_id.clone(),
+        })
+        .unwrap();
+        assert!(rt.decision_stances().is_empty());
+
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        assert_eq!(
+            rt.decision_stances().get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id
+            }),
+        );
     }
 
     #[test]
