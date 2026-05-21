@@ -54,6 +54,13 @@ pub enum Cause {
         decision_id: EventId,
         contribution: f32,
     },
+    /// A `Dampened` Decision suppressed a resonance delta on the
+    /// target project (ADR-0008
+    /// `#dampened-x03-with-goal-amp-suppressed`). `factor` is the
+    /// multiplier applied to the matching system's base delta. Goal
+    /// amplification is **mutually exclusive** with this cause — a
+    /// dampened ChangeRecord never carries `GoalAmplified`.
+    DecisionDampened { decision_id: EventId, factor: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +150,13 @@ fn render_cause(c: &Cause) -> String {
         } => format!(
             "Decision {} contributed boost +{:.3} on visible strategic_relevance",
             decision_id, contribution,
+        ),
+        Cause::DecisionDampened {
+            decision_id,
+            factor,
+        } => format!(
+            "Decision {} dampened resonance by ×{:.2} (goal amplification suppressed)",
+            decision_id, factor,
         ),
     }
 }
