@@ -2329,4 +2329,199 @@ mod tests {
             dec.event_id,
         );
     }
+
+    // -------- Decision: Dampened — ×0.3 resonance + goal-amp suppression (issue #5) --------
+    //
+    // Per ADR-0008 `#dampened-x03-with-goal-amp-suppressed`:
+    //   - For projects whose stance is `Dampened`, the matching system
+    //     scales resonance deltas by `0.3`.
+    //   - Goal amplification does **not** apply to dampened projects
+    //     (mutually exclusive — the user's explicit per-project opt-in
+    //     beats implicit goal-tag overlap).
+    //   - Non-dampened projects retain their existing amplification
+    //     behaviour.
+
+    fn relevance_delta_for(records: &[ChangeRecord], entity: &str) -> f32 {
+        records
+            .iter()
+            .find(|r| r.entity_id == entity && r.field == "strategic_relevance")
+            .map(|r| r.after - r.before)
+            .expect("strategic_relevance change present")
+    }
+
+    #[test]
+    fn dampened_signal_scales_resonance_by_0_3() {
+        // Baseline: identical project + signal in a no-decision runtime.
+        let mut base_rt = WorldRuntime::in_memory().unwrap();
+        base_rt.ingest(project("tnt", &["ai"])).unwrap();
+        base_rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let base_records = base_rt.advance().unwrap();
+        let base_delta = relevance_delta_for(&base_records.records, "tnt");
+
+        // Dampened version: identical project, dampened by a Decision.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        // Need a `chose` target to satisfy ADR-0008's required field.
+        rt.ingest(project("focus", &[])).unwrap();
+        rt.ingest(WorldEvent::DecisionRecorded {
+            chose: "focus".into(),
+            over: vec![],
+            dampen: vec!["tnt".into()],
+            reason: None,
+            decided_at: None,
+        })
+        .unwrap();
+        rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let damp_records = rt.advance().unwrap();
+        let damp_delta = relevance_delta_for(&damp_records.records, "tnt");
+
+        let ratio = damp_delta / base_delta;
+        assert!(
+            (ratio - 0.3).abs() < 1e-4,
+            "dampened resonance should be ×0.3 of base: base={base_delta} damp={damp_delta} ratio={ratio}",
+        );
+    }
+
+    #[test]
+    fn dampened_project_skips_goal_amplification() {
+        // Goal-only baseline (no dampening): factor 1.5 over base.
+        let mut base_rt = WorldRuntime::in_memory().unwrap();
+        base_rt.ingest(project("tnt", &["ai"])).unwrap();
+        base_rt
+            .ingest(WorldEvent::GoalCreated {
+                id: "g".into(),
+                name: "g".into(),
+                tags: vec!["ai".into()],
+                importance: 1.0,
+            })
+            .unwrap();
+        base_rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let base_records = base_rt.advance().unwrap();
+        let base_amped_delta = relevance_delta_for(&base_records.records, "tnt");
+        // Without dampening, a max-importance overlapping Goal gives ×1.5.
+        let raw_delta = base_amped_delta / 1.5;
+
+        // Same goal + dampening on tnt → goal amplification suppressed.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("focus", &[])).unwrap();
+        rt.ingest(WorldEvent::GoalCreated {
+            id: "g".into(),
+            name: "g".into(),
+            tags: vec!["ai".into()],
+            importance: 1.0,
+        })
+        .unwrap();
+        rt.ingest(WorldEvent::DecisionRecorded {
+            chose: "focus".into(),
+            over: vec![],
+            dampen: vec!["tnt".into()],
+            reason: None,
+            decided_at: None,
+        })
+        .unwrap();
+        rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let damp_records = rt.advance().unwrap();
+        let damp_delta = relevance_delta_for(&damp_records.records, "tnt");
+
+        // Expected: raw_delta × 0.3 — no goal-amp factor in the chain.
+        let expected = raw_delta * 0.3;
+        assert!(
+            (damp_delta - expected).abs() < 1e-4,
+            "dampened + goal should still be ×0.3 of raw (no amp): expected≈{expected}, got {damp_delta}",
+        );
+
+        // Also: no GoalAmplified cause on the dampened record.
+        let has_goal_amp = damp_records
+            .records
+            .iter()
+            .filter(|r| r.entity_id == "tnt")
+            .flat_map(|r| r.causes.iter())
+            .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
+        assert!(
+            !has_goal_amp,
+            "dampened project must not carry a GoalAmplified cause: {:?}",
+            damp_records.records,
+        );
+    }
+
+    #[test]
+    fn non_dampened_project_with_matching_goal_still_amplifies() {
+        // Control: same setup as above but project `tnt` is NOT in
+        // anyone's dampen list. Goal amp should fire (×1.5).
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("other", &[])).unwrap();
+        rt.ingest(WorldEvent::GoalCreated {
+            id: "g".into(),
+            name: "g".into(),
+            tags: vec!["ai".into()],
+            importance: 1.0,
+        })
+        .unwrap();
+        rt.ingest(WorldEvent::DecisionRecorded {
+            chose: "other".into(),
+            over: vec![],
+            dampen: vec![],
+            reason: None,
+            decided_at: None,
+        })
+        .unwrap();
+        rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let records = rt.advance().unwrap();
+        let has_goal_amp = records
+            .records
+            .iter()
+            .filter(|r| r.entity_id == "tnt")
+            .flat_map(|r| r.causes.iter())
+            .any(|c| matches!(c, crate::Cause::GoalAmplified { .. }));
+        assert!(
+            has_goal_amp,
+            "non-dampened project with matching goal should carry GoalAmplified",
+        );
+    }
+
+    #[test]
+    fn dampened_change_record_cites_decision_dampened_cause() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("focus", &[])).unwrap();
+        let dec = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "focus".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let records = rt.advance().unwrap();
+
+        let cited = records.records.iter().any(|r| {
+            r.entity_id == "tnt"
+                && r.field == "strategic_relevance"
+                && r.causes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::Cause::DecisionDampened { decision_id, factor }
+                            if decision_id == &dec.event_id && (*factor - 0.3).abs() < 1e-6
+                    )
+                })
+        });
+        assert!(
+            cited,
+            "dampened change record should carry DecisionDampened cause: {:?}",
+            records.records,
+        );
+
+        let rendered = rt
+            .explain(ExplainTarget::Entity("tnt".into()))
+            .unwrap()
+            .to_string();
+        assert!(
+            rendered.contains(dec.event_id.as_str()),
+            "explain should cite the dampening decision id, got:\n{rendered}",
+        );
+    }
 }

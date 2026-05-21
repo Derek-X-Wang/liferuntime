@@ -170,18 +170,22 @@ pub fn signal_project_matching_system(
     mut commands: Commands,
     signals: Query<(Entity, &Signal), With<Unprocessed>>,
     goals: Query<(&Identity, &Goal)>,
-    mut projects: Query<(Entity, &Identity, &mut Project)>,
+    mut projects: Query<(Entity, &Identity, &mut Project, Option<&DecisionStance>)>,
     mut change_log: ResMut<ChangeLog>,
 ) {
+    /// Dampening factor on resonance deltas for `Dampened` projects
+    /// (ADR-0008 `#dampened-x03-with-goal-amp-suppressed`).
+    const DAMPENING_FACTOR: f32 = 0.3;
+
     let goal_snapshot: Vec<(Identity, Goal)> = goals
         .iter()
         .map(|(id, g)| (id.clone(), g.clone()))
         .collect();
 
     for (signal_entity, signal) in &signals {
-        let (factor, amplifier_cause) = goal_amplifier(&goal_snapshot, &signal.tags);
+        let (goal_factor, amplifier_cause) = goal_amplifier(&goal_snapshot, &signal.tags);
 
-        for (project_entity, project_id, mut project) in &mut projects {
+        for (project_entity, project_id, mut project, stance) in &mut projects {
             // Under per-event scheduling (ADR-0006), matching runs at
             // the moment a signal is ingested. Archive events that
             // arrive *after* this signal haven't happened yet from
@@ -207,15 +211,33 @@ pub fn signal_project_matching_system(
 
             let breadth = project.tags.len().max(1) as f32;
             let overlap = matched.len() as f32 / breadth;
-            let relevance_delta = overlap * signal.confidence * 0.25 * factor;
-            let urgency_delta = overlap * signal.confidence * 0.15 * factor;
+            let base_relevance_delta = overlap * signal.confidence * 0.25;
+            let base_urgency_delta = overlap * signal.confidence * 0.15;
+
+            // ADR-0008 `#dampened-x03-with-goal-amp-suppressed`: if
+            // the project is currently Dampened, scale by 0.3 AND
+            // suppress goal amplification. Otherwise the existing
+            // goal-amp behavior is unchanged.
+            let (factor, extra_cause): (f32, Option<Cause>) = match stance {
+                Some(DecisionStance::Dampened { decision_id }) => (
+                    DAMPENING_FACTOR,
+                    Some(Cause::DecisionDampened {
+                        decision_id: decision_id.clone(),
+                        factor: DAMPENING_FACTOR,
+                    }),
+                ),
+                _ => (goal_factor, amplifier_cause.clone()),
+            };
+
+            let relevance_delta = base_relevance_delta * factor;
+            let urgency_delta = base_urgency_delta * factor;
 
             let mut causes = vec![Cause::SignalMatched {
                 signal_summary: signal.summary.clone(),
                 matched_tags: matched.clone(),
                 confidence: signal.confidence,
             }];
-            if let Some(c) = amplifier_cause.clone() {
+            if let Some(c) = extra_cause {
                 causes.push(c);
             }
 
