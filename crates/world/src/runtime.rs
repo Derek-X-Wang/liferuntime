@@ -2524,4 +2524,399 @@ mod tests {
             "explain should cite the dampening decision id, got:\n{rendered}",
         );
     }
+
+    // -------- Decision: stance flip on supersession (issue #6) --------
+    //
+    // Per ADR-0008 `#per-project-stance-derived-by-replay`:
+    //   - Chosen → Dampened: drop the boost component; matching now
+    //     applies ×0.3 to resonance deltas.
+    //   - Dampened → Chosen: start a *fresh* `+0.15` boost owned by
+    //     the new Decision.
+    //   - Chosen → Chosen (same project): boost resets to `+0.15` —
+    //     boosts do NOT stack.
+    //   - Dampened → Dampened (same project): stance.decision_id
+    //     updates; mechanic stays ×0.3.
+
+    #[test]
+    fn stance_flip_chose_then_dampen_drops_boost() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("other", &[])).unwrap();
+
+        let _dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let view_chose = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (view_chose.strategic_relevance_visible - view_chose.strategic_relevance_raw - 0.15)
+                .abs()
+                < 1e-4,
+            "Chosen: visible should equal raw + 0.15"
+        );
+
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "other".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let view_dampen = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (view_dampen.strategic_relevance_visible - view_dampen.strategic_relevance_raw).abs()
+                < 1e-6,
+            "Dampened: visible should drop back to raw (boost dropped): raw={} visible={}",
+            view_dampen.strategic_relevance_raw,
+            view_dampen.strategic_relevance_visible,
+        );
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Dampened {
+                decision_id: dec_b.event_id.clone()
+            }),
+        );
+    }
+
+    #[test]
+    fn stance_flip_dampen_then_chose_starts_fresh_boost() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("other", &[])).unwrap();
+
+        let _dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "other".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let view_after_dampen = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (view_after_dampen.strategic_relevance_visible
+                - view_after_dampen.strategic_relevance_raw)
+                .abs()
+                < 1e-6,
+            "no boost while Dampened",
+        );
+
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let view_after_chose = rt.inspect_project("tnt").unwrap();
+        let contribution =
+            view_after_chose.strategic_relevance_visible - view_after_chose.strategic_relevance_raw;
+        assert!(
+            (contribution - 0.15).abs() < 1e-4,
+            "Dampened→Chosen should start fresh +0.15 boost owned by B, got {contribution}",
+        );
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            }),
+        );
+    }
+
+    #[test]
+    fn two_consecutive_chose_on_same_project_do_not_stack_boost() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        let _dec_a = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0,
+            )
+            .unwrap();
+        // Let 30 days erode A's boost.
+        rt.ingest_at(
+            WorldEvent::TimePulseObserved {
+                observed_at: t0 + Duration::days(30),
+            },
+            t0 + Duration::days(30),
+        )
+        .unwrap();
+        let mid = rt.inspect_project("tnt").unwrap();
+        let mid_boost = mid.strategic_relevance_visible - mid.strategic_relevance_raw;
+        assert!(
+            mid_boost > 0.0 && mid_boost < 0.15,
+            "A's boost should have decayed below 0.15, got {mid_boost}",
+        );
+
+        let dec_b = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0 + Duration::days(30),
+            )
+            .unwrap();
+
+        let after_b = rt.inspect_project("tnt").unwrap();
+        let new_boost = after_b.strategic_relevance_visible - after_b.strategic_relevance_raw;
+        assert!(
+            (new_boost - 0.15).abs() < 1e-4,
+            "Chosen→Chosen should *reset* to +0.15 (no stacking), got {new_boost}",
+        );
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_b.event_id.clone()
+            }),
+        );
+    }
+
+    #[test]
+    fn two_consecutive_dampen_on_same_project_keep_factor_0_3() {
+        // Build the dampened runtime: tnt is dampened by Decision A,
+        // then again by Decision B. tnt's stance is Dampened{B} and
+        // the matching factor stays 0.3.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("o1", &[])).unwrap();
+        rt.ingest(project("o2", &[])).unwrap();
+        let _dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "o1".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "o2".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let stances = rt.decision_stances();
+        assert_eq!(
+            stances.get("tnt"),
+            Some(&DecisionStance::Dampened {
+                decision_id: dec_b.event_id.clone()
+            }),
+            "Dampened→Dampened: stance.decision_id updates to the latest",
+        );
+
+        // Compute the base delta in an undampened runtime.
+        let mut base_rt = WorldRuntime::in_memory().unwrap();
+        base_rt.ingest(project("tnt", &["ai"])).unwrap();
+        base_rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let base_records = base_rt.advance().unwrap();
+        let base_delta = relevance_delta_for(&base_records.records, "tnt");
+
+        rt.ingest(signal("ai news", &["ai"], 0.8)).unwrap();
+        let damp_records = rt.advance().unwrap();
+        let damp_delta = relevance_delta_for(&damp_records.records, "tnt");
+        let ratio = damp_delta / base_delta;
+        assert!(
+            (ratio - 0.3).abs() < 1e-4,
+            "Dampened→Dampened should remain ×0.3, got {ratio}",
+        );
+
+        // Cause cites the most-recent (B) decision_id.
+        let cited_by_b = damp_records.records.iter().any(|r| {
+            r.entity_id == "tnt"
+                && r.causes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::Cause::DecisionDampened { decision_id, .. }
+                            if decision_id == &dec_b.event_id
+                    )
+                })
+        });
+        assert!(
+            cited_by_b,
+            "Cause::DecisionDampened should cite the latest decision_id (B)",
+        );
+    }
+
+    #[test]
+    fn chain_chose_dampen_chose_revoke_yields_expected_state_at_each_step() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("other", &[])).unwrap();
+
+        // 1. chose tnt → Chosen{A} + boost ≈ 0.15.
+        let _dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let s1 = rt.inspect_project("tnt").unwrap();
+        assert!((s1.strategic_relevance_visible - s1.strategic_relevance_raw - 0.15).abs() < 1e-4);
+
+        // 2. dampen tnt (Decision B chose `other`, dampen tnt) →
+        //    Dampened{B}, boost dropped.
+        let _dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "other".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let s2 = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (s2.strategic_relevance_visible - s2.strategic_relevance_raw).abs() < 1e-6,
+            "no boost after Chosen→Dampened",
+        );
+
+        // 3. chose tnt again (Decision C) → Chosen{C} + fresh boost.
+        let dec_c = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let s3 = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (s3.strategic_relevance_visible - s3.strategic_relevance_raw - 0.15).abs() < 1e-4,
+            "fresh +0.15 boost on Dampened→Chosen",
+        );
+        let st3 = rt.decision_stances();
+        assert_eq!(
+            st3.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_c.event_id.clone()
+            }),
+        );
+
+        // 4. revoke C → no stance, no boost.
+        rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: dec_c.event_id.clone(),
+        })
+        .unwrap();
+        let s4 = rt.inspect_project("tnt").unwrap();
+        assert!(
+            (s4.strategic_relevance_visible - s4.strategic_relevance_raw).abs() < 1e-6,
+            "no boost after revoke",
+        );
+        let st4 = rt.decision_stances();
+        assert!(
+            !st4.contains_key("tnt"),
+            "no stance after revoke of the last steering Decision: {st4:?}",
+        );
+    }
+
+    #[test]
+    fn supersession_state_is_deterministic_on_repeated_replay() {
+        let dir = tempfile_dir();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let dec_c_id;
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+            rt.ingest_at(project("other", &[]), t0).unwrap();
+            rt.ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0 + Duration::seconds(1),
+            )
+            .unwrap();
+            rt.ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "other".into(),
+                    over: vec![],
+                    dampen: vec!["tnt".into()],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0 + Duration::seconds(2),
+            )
+            .unwrap();
+            let c = rt
+                .ingest_at(
+                    WorldEvent::DecisionRecorded {
+                        chose: "tnt".into(),
+                        over: vec![],
+                        dampen: vec![],
+                        reason: None,
+                        decided_at: None,
+                    },
+                    t0 + Duration::seconds(3),
+                )
+                .unwrap();
+            dec_c_id = c.event_id;
+        }
+
+        // Re-open twice; the derived state must match.
+        let mut rt1 = WorldRuntime::open_dir(&dir).unwrap();
+        let s1 = rt1.decision_stances();
+        let v1 = rt1.inspect_project("tnt").unwrap();
+        drop(rt1);
+
+        let mut rt2 = WorldRuntime::open_dir(&dir).unwrap();
+        let s2 = rt2.decision_stances();
+        let v2 = rt2.inspect_project("tnt").unwrap();
+
+        assert_eq!(s1.get("tnt"), s2.get("tnt"));
+        assert_eq!(
+            s1.get("tnt"),
+            Some(&DecisionStance::Chosen {
+                decision_id: dec_c_id
+            }),
+        );
+        assert!(
+            (v1.strategic_relevance_raw - v2.strategic_relevance_raw).abs() < 1e-6,
+            "raw must be deterministic across replays"
+        );
+        assert!(
+            (v1.strategic_relevance_visible - v2.strategic_relevance_visible).abs() < 1e-6,
+            "visible must be deterministic across replays"
+        );
+    }
 }
