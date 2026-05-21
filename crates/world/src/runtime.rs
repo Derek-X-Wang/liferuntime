@@ -16,7 +16,10 @@ use crate::model::{
     DecisionBoost, DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now,
     PendingDecision, Project, ProjectStatus, RecordedDecisions, Signal, Unprocessed,
 };
-use crate::queries::{ProjectTrajectoryView, ProjectView};
+use crate::queries::{
+    DecisionListView, DecisionSteerView, DecisionSupersessionView, ProjectTrajectoryView,
+    ProjectView, SteerKind,
+};
 use crate::systems::register_systems;
 
 /// Persistent cursor for "what has the user already advanced through".
@@ -408,6 +411,124 @@ impl WorldRuntime {
         q.iter(&self.world)
             .map(|(ident, stance)| (ident.0.clone(), stance.clone()))
             .collect()
+    }
+
+    /// Build the polished view consumed by `liferuntime decision list`
+    /// (issue #7).
+    ///
+    /// Walks the event log in insertion order to recover each
+    /// Decision's *original* payload (chose / over / dampen /
+    /// decided_at), then joins against the derived current stance +
+    /// boost components to compute `steers` and `superseded_for`.
+    /// Revoked Decisions are excluded.
+    ///
+    /// Returns entries in chronological (replay-order) order.
+    pub fn decision_list(&mut self) -> Result<Vec<DecisionListView>, RuntimeError> {
+        // 1. Walk the log: collect Decision metadata + revoke set.
+        let events = self.log.replay_all()?;
+        let mut revoked: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+        struct Meta {
+            decision_id: EventId,
+            chose: String,
+            over: Vec<String>,
+            dampen: Vec<String>,
+            decided_at: DateTime<Utc>,
+        }
+        let mut metas: Vec<Meta> = Vec::new();
+        for stored in &events {
+            match &stored.payload {
+                WorldEvent::DecisionRecorded {
+                    chose,
+                    over,
+                    dampen,
+                    decided_at,
+                    ..
+                } => {
+                    metas.push(Meta {
+                        decision_id: stored.id.clone(),
+                        chose: chose.clone(),
+                        over: over.clone(),
+                        dampen: dampen.clone(),
+                        decided_at: decided_at.unwrap_or(stored.occurred_at),
+                    });
+                }
+                WorldEvent::DecisionRevoked { decision_id } => {
+                    revoked.insert(decision_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Snapshot current per-project stance + boost.
+        let mut current: HashMap<String, (DecisionStance, Option<f32>)> = HashMap::new();
+        let mut q = self
+            .world
+            .query::<(&Identity, &DecisionStance, Option<&DecisionBoost>)>();
+        for (ident, stance, boost) in q.iter(&self.world) {
+            current.insert(
+                ident.0.clone(),
+                (stance.clone(), boost.map(|b| b.remaining)),
+            );
+        }
+        let now = self.world.resource::<Now>().at();
+
+        // 3. Compose views.
+        let mut out: Vec<DecisionListView> = Vec::new();
+        for meta in metas {
+            if revoked.contains(&meta.decision_id) {
+                continue;
+            }
+
+            let mut steers: Vec<DecisionSteerView> = Vec::new();
+            let mut superseded: Vec<DecisionSupersessionView> = Vec::new();
+
+            let mut classify = |proj_id: &String, kind: SteerKind| {
+                if let Some((stance, boost)) = current.get(proj_id) {
+                    if stance.decision_id() == &meta.decision_id {
+                        steers.push(DecisionSteerView {
+                            project_id: proj_id.clone(),
+                            kind,
+                            boost_remaining: *boost,
+                        });
+                    } else {
+                        superseded.push(DecisionSupersessionView {
+                            project_id: proj_id.clone(),
+                            by_decision_id: stance.decision_id().clone(),
+                        });
+                    }
+                }
+                // No current stance → silently omit. The Decision
+                // originally targeted this project, but a later
+                // Decision claimed it and was then revoked (or some
+                // other clearing path); there's nothing to "supersede
+                // for" if the new owner is gone.
+            };
+
+            // chose first.
+            classify(&meta.chose, SteerKind::Chose);
+            // dampened, skipping any project also named in chose to
+            // avoid double-counting (chose wins).
+            for proj_id in &meta.dampen {
+                if proj_id == &meta.chose {
+                    continue;
+                }
+                classify(proj_id, SteerKind::Dampened);
+            }
+
+            let active_days = (now - meta.decided_at).num_days().max(0);
+
+            out.push(DecisionListView {
+                decision_id: meta.decision_id,
+                chose: meta.chose,
+                over: meta.over,
+                dampen: meta.dampen,
+                decided_at: meta.decided_at,
+                active_event_log_days: active_days,
+                steers,
+                superseded_for: superseded,
+            });
+        }
+        Ok(out)
     }
 
     pub fn inspect_project(&mut self, id: &str) -> Option<ProjectView> {
@@ -2917,6 +3038,299 @@ mod tests {
         assert!(
             (v1.strategic_relevance_visible - v2.strategic_relevance_visible).abs() < 1e-6,
             "visible must be deterministic across replays"
+        );
+    }
+
+    // -------- Decision: decision list polish (issue #7) --------
+
+    use crate::queries::{format_decision_list, SteerKind};
+
+    #[test]
+    fn decision_list_single_chose_plus_dampen() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+        let dec = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec!["side-x".into()],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list.len(), 1);
+        let entry = &list[0];
+        assert_eq!(entry.decision_id, dec.event_id);
+        assert_eq!(entry.chose, "tnt");
+        assert_eq!(entry.over, vec!["side-x".to_string()]);
+        assert_eq!(entry.dampen, vec!["side-x".to_string()]);
+
+        // chose-projects first, then dampened. tnt and side-x are
+        // different projects → two steers, in that order.
+        assert_eq!(entry.steers.len(), 2);
+        assert_eq!(entry.steers[0].project_id, "tnt");
+        assert!(matches!(entry.steers[0].kind, SteerKind::Chose));
+        assert!(entry.steers[0].boost_remaining.unwrap() > 0.14);
+        assert_eq!(entry.steers[1].project_id, "side-x");
+        assert!(matches!(entry.steers[1].kind, SteerKind::Dampened));
+        assert!(entry.steers[1].boost_remaining.is_none());
+        assert!(entry.superseded_for.is_empty());
+    }
+
+    #[test]
+    fn decision_list_chose_wins_when_same_project_in_dampen() {
+        // Edge case: chose and dampen both name the same project.
+        // Per decision_application_system, chose wins → DecisionStance
+        // is Chosen. The list view should show one `Chose` steer,
+        // not two.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let _dec = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["tnt".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list[0].steers.len(), 1);
+        assert!(matches!(list[0].steers[0].kind, SteerKind::Chose));
+    }
+
+    #[test]
+    fn decision_list_separately_listed_dampen_and_chose() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-y", &["voice"])).unwrap();
+        let _dec = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["side-y".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list.len(), 1);
+        let entry = &list[0];
+        assert_eq!(entry.steers.len(), 2);
+        assert_eq!(entry.steers[0].project_id, "tnt");
+        assert!(matches!(entry.steers[0].kind, SteerKind::Chose));
+        assert_eq!(entry.steers[1].project_id, "side-y");
+        assert!(matches!(entry.steers[1].kind, SteerKind::Dampened));
+    }
+
+    #[test]
+    fn decision_list_partial_supersession_emits_superseded_for() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+        let dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec!["side-x".into()],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        let dec_b = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "side-x".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list.len(), 2, "two non-revoked decisions");
+        let a = list
+            .iter()
+            .find(|e| e.decision_id == dec_a.event_id)
+            .unwrap();
+        // A still steers tnt (chose). side-x has been superseded by B.
+        assert_eq!(a.steers.len(), 1);
+        assert_eq!(a.steers[0].project_id, "tnt");
+        assert_eq!(a.superseded_for.len(), 1);
+        assert_eq!(a.superseded_for[0].project_id, "side-x");
+        assert_eq!(a.superseded_for[0].by_decision_id, dec_b.event_id);
+
+        // B steers side-x; no supersession.
+        let b = list
+            .iter()
+            .find(|e| e.decision_id == dec_b.event_id)
+            .unwrap();
+        assert_eq!(b.steers.len(), 1);
+        assert_eq!(b.steers[0].project_id, "side-x");
+        assert!(b.superseded_for.is_empty());
+    }
+
+    #[test]
+    fn decision_list_excludes_revoked_decisions() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let dec_a = rt
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: None,
+                decided_at: None,
+            })
+            .unwrap();
+        rt.ingest(WorldEvent::DecisionRevoked {
+            decision_id: dec_a.event_id.clone(),
+        })
+        .unwrap();
+        let list = rt.decision_list().unwrap();
+        assert!(
+            list.is_empty(),
+            "revoked decision should not appear: {list:?}",
+        );
+    }
+
+    #[test]
+    fn decision_list_keeps_zero_boost_decision_if_not_revoked() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t0).unwrap();
+        let _dec = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t0),
+                },
+                t0,
+            )
+            .unwrap();
+        // 5000 event-log days → 0.15 * 0.999^5000 ≈ 0.001.
+        rt.ingest_at(
+            WorldEvent::TimePulseObserved {
+                observed_at: t0 + Duration::days(5000),
+            },
+            t0 + Duration::days(5000),
+        )
+        .unwrap();
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list.len(), 1);
+        let boost = list[0].steers[0].boost_remaining.unwrap_or(0.0);
+        assert!(
+            boost < 0.01,
+            "boost should have eroded near zero, got {boost}",
+        );
+    }
+
+    #[test]
+    fn decision_list_chronological_order() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        rt.ingest_at(project("a", &["x"]), t0).unwrap();
+        rt.ingest_at(project("b", &["x"]), t0).unwrap();
+        let dec1 = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "a".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0 + Duration::seconds(1),
+            )
+            .unwrap();
+        let dec2 = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "b".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: None,
+                },
+                t0 + Duration::seconds(2),
+            )
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        assert_eq!(list[0].decision_id, dec1.event_id);
+        assert_eq!(list[1].decision_id, dec2.event_id);
+    }
+
+    #[test]
+    fn decision_list_format_matches_spec() {
+        // Partial-supersession scenario rendered to the exact format
+        // from issue #7. Boost numbers and active-day counts are
+        // pulled from the live list so we don't hardcode float math.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        let t_a = Utc.with_ymd_and_hms(2026, 5, 19, 0, 0, 0).unwrap();
+        let t_b = Utc.with_ymd_and_hms(2026, 5, 21, 0, 0, 0).unwrap();
+        rt.ingest_at(project("tnt", &["ai"]), t_a).unwrap();
+        rt.ingest_at(project("side-x", &["voice"]), t_a).unwrap();
+        let dec_a = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "tnt".into(),
+                    over: vec!["side-x".into()],
+                    dampen: vec!["side-x".into()],
+                    reason: None,
+                    decided_at: Some(t_a),
+                },
+                t_a,
+            )
+            .unwrap();
+        let dec_b = rt
+            .ingest_at(
+                WorldEvent::DecisionRecorded {
+                    chose: "side-x".into(),
+                    over: vec![],
+                    dampen: vec![],
+                    reason: None,
+                    decided_at: Some(t_b),
+                },
+                t_b,
+            )
+            .unwrap();
+
+        let list = rt.decision_list().unwrap();
+        let rendered = format_decision_list(&list);
+
+        let entry_a = list
+            .iter()
+            .find(|e| e.decision_id == dec_a.event_id)
+            .unwrap();
+        let entry_b = list
+            .iter()
+            .find(|e| e.decision_id == dec_b.event_id)
+            .unwrap();
+        let boost_a = entry_a.steers[0].boost_remaining.unwrap();
+        let boost_b = entry_b.steers[0].boost_remaining.unwrap();
+        let active_a = entry_a.active_event_log_days;
+        let active_b = entry_b.active_event_log_days;
+
+        let expected = format!(
+            "{a} chose:tnt over:[side-x] dampen:[side-x]\n  decided 2026-05-19, active {active_a} event-log days\n  steers tnt (chose, boost {ba:.3} remaining of 0.150)\n  superseded for side-x by {b}\n\n{b} chose:side-x over:[] dampen:[]\n  decided 2026-05-21, active {active_b} event-log days\n  steers side-x (chose, boost {bb:.3} remaining of 0.150)\n",
+            a = dec_a.event_id,
+            b = dec_b.event_id,
+            ba = boost_a,
+            bb = boost_b,
+        );
+
+        assert_eq!(
+            rendered, expected,
+            "rendered output mismatched spec:\n--- got:\n{rendered}\n--- expected:\n{expected}",
         );
     }
 }

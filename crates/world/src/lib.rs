@@ -24,5 +24,8 @@ pub use model::{
     DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project,
     ProjectStatus, Signal,
 };
-pub use queries::{GoalView, ProjectTrajectoryView, ProjectView};
+pub use queries::{
+    format_decision_list, DecisionListView, DecisionSteerView, DecisionSupersessionView, GoalView,
+    ProjectTrajectoryView, ProjectView, SteerKind,
+};
 pub use runtime::{IngestReceipt, WorldChanges, WorldRuntime};
