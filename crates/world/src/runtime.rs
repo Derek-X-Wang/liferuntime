@@ -275,6 +275,32 @@ impl WorldRuntime {
                 }
             }
             WorldEvent::TimePulseObserved { .. } => { /* no validation */ }
+            WorldEvent::DecisionRecorded {
+                chose,
+                over,
+                dampen,
+                ..
+            } => {
+                // ADR-0008 + issue #1: every project id referenced by a
+                // Decision must already exist. Reject otherwise so the
+                // log never contains a Decision pointing at a ghost
+                // project — keeps stance derivation (issue #2) simple
+                // and replay-safe.
+                if !self.project_exists(chose) {
+                    return Err(RuntimeError::EntityNotFound {
+                        kind: "Project",
+                        id: chose.clone(),
+                    });
+                }
+                for id in over.iter().chain(dampen.iter()) {
+                    if !self.project_exists(id) {
+                        return Err(RuntimeError::EntityNotFound {
+                            kind: "Project",
+                            id: id.clone(),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -663,6 +689,11 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                     break;
                 }
             }
+        }
+        WorldEvent::DecisionRecorded { .. } => {
+            // Tracer slice (issue #1): event lands in the log and the
+            // resource clock advances, but derived state is untouched.
+            // Stance derivation arrives in issue #2.
         }
     }
 }
@@ -1404,6 +1435,182 @@ mod tests {
             decay.after > 0.5,
             "decay should approach 0.5 baseline asymptotically, not undershoot: {}",
             decay.after
+        );
+    }
+
+    // -------- Decision: event-log tracer (issue #1) --------
+    //
+    // Per ADR-0008 + ADR-0005, `DecisionRecorded` is an additive event
+    // variant. This first slice plumbs the variant end-to-end with **no
+    // system effects yet** — derived state must be unchanged. Later
+    // slices (issues #2..#7) add stance derivation, boost, and
+    // dampening.
+
+    #[test]
+    fn decision_recorded_does_not_change_derived_state() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        runtime.ingest(project("tnt", &["ai"])).unwrap();
+        let before = runtime.inspect_project("tnt").expect("project exists");
+        runtime
+            .ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec![],
+                dampen: vec![],
+                reason: Some("focus".into()),
+                decided_at: None,
+            })
+            .unwrap();
+        let after = runtime
+            .inspect_project("tnt")
+            .expect("project still exists");
+        assert!(
+            (before.strategic_relevance - after.strategic_relevance).abs() < 1e-6,
+            "tracer slice should not move strategic_relevance: {} → {}",
+            before.strategic_relevance,
+            after.strategic_relevance
+        );
+        assert!((before.urgency - after.urgency).abs() < 1e-6);
+        assert_eq!(before.status, after.status);
+    }
+
+    #[test]
+    fn decision_recorded_rejects_unknown_chose() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        runtime.ingest(project("tnt", &["ai"])).unwrap();
+        let result = runtime.ingest(WorldEvent::DecisionRecorded {
+            chose: "ghost".into(),
+            over: vec![],
+            dampen: vec![],
+            reason: None,
+            decided_at: None,
+        });
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
+            "expected EntityNotFound for unknown chose, got {result:?}"
+        );
+        // No event appended on rejection.
+        assert_eq!(runtime.event_count(), 1);
+    }
+
+    #[test]
+    fn decision_recorded_rejects_unknown_over() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        runtime.ingest(project("tnt", &["ai"])).unwrap();
+        let result = runtime.ingest(WorldEvent::DecisionRecorded {
+            chose: "tnt".into(),
+            over: vec!["ghost".into()],
+            dampen: vec![],
+            reason: None,
+            decided_at: None,
+        });
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
+            "expected EntityNotFound for unknown over, got {result:?}"
+        );
+        assert_eq!(runtime.event_count(), 1);
+    }
+
+    #[test]
+    fn decision_recorded_rejects_unknown_dampen() {
+        let mut runtime = WorldRuntime::in_memory().unwrap();
+        runtime.ingest(project("tnt", &["ai"])).unwrap();
+        let result = runtime.ingest(WorldEvent::DecisionRecorded {
+            chose: "tnt".into(),
+            over: vec![],
+            dampen: vec!["ghost".into()],
+            reason: None,
+            decided_at: None,
+        });
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
+            "expected EntityNotFound for unknown dampen, got {result:?}"
+        );
+        assert_eq!(runtime.event_count(), 1);
+    }
+
+    #[test]
+    fn decision_recorded_jsonl_roundtrip_replay_unchanged() {
+        let dir = tempfile_dir();
+
+        // First "CLI invocation": record projects and a decision.
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(project("tnt", &["ai", "voice"])).unwrap();
+            rt.ingest(project("side-x", &["voice"])).unwrap();
+            rt.ingest(WorldEvent::DecisionRecorded {
+                chose: "tnt".into(),
+                over: vec!["side-x".into()],
+                dampen: vec!["side-x".into()],
+                reason: Some("ship voice first".into()),
+                decided_at: None,
+            })
+            .unwrap();
+        }
+
+        // Re-open: replay must succeed without panic, the event count
+        // reflects the persisted decision, and derived state matches
+        // the no-decision baseline (per-event scheduling derived nothing
+        // from the tracer in this slice).
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        assert_eq!(
+            rt.event_count(),
+            3,
+            "two projects + one decision should be persisted"
+        );
+        let tnt = rt.inspect_project("tnt").expect("tnt persisted");
+        let side = rt.inspect_project("side-x").expect("side-x persisted");
+        assert!(
+            (tnt.strategic_relevance - 0.5).abs() < 1e-6,
+            "tracer slice must not move strategic_relevance: {}",
+            tnt.strategic_relevance
+        );
+        assert!((side.strategic_relevance - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pre_decision_log_still_replays_with_new_variant_present() {
+        // Additive-variant guarantee (ADR-0005): a log written before
+        // Decision events existed must replay byte-identically into a
+        // binary that knows about DecisionRecorded. The new variant
+        // simply doesn't appear in the log, so replay should match what
+        // the runtime produced previously.
+        let dir = tempfile_dir();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest_at(project("tnt", &["ai", "voice"]), t0).unwrap();
+            rt.ingest_at(
+                signal("voice progress", &["voice", "ai"], 0.6),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        }
+
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let tnt = rt.inspect_project("tnt").expect("project exists");
+        assert!(
+            tnt.strategic_relevance > 0.5,
+            "existing matching behavior must survive the additive variant addition, got {}",
+            tnt.strategic_relevance
         );
     }
 }

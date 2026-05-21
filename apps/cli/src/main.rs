@@ -75,6 +75,32 @@ enum Command {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Record a strategic Decision (ADR-0008): commit to one Project,
+    /// optionally over named rivals, optionally dampening explicit
+    /// suppression targets. This slice (issue #1) plumbs the event
+    /// end-to-end; the boost / dampening mechanics arrive in later
+    /// slices.
+    Decide {
+        /// Committed-to Project id.
+        #[arg(long)]
+        chose: String,
+        /// Narrative rival Project ids; **no mechanical effect** (per
+        /// ADR-0008). Surfaced later by `decision list` / `explain`.
+        #[arg(long, value_delimiter = ',')]
+        over: Vec<String>,
+        /// Project ids whose resonance deltas should be mechanically
+        /// dampened. Empty by default — the user must opt in.
+        #[arg(long, value_delimiter = ',')]
+        dampen: Vec<String>,
+        /// Free-text rationale for the decision.
+        #[arg(long = "because")]
+        reason: Option<String>,
+        /// Override the decision timestamp. Defaults to ingest time
+        /// (i.e. the envelope's `occurred_at`).
+        #[arg(long = "decided-at")]
+        decided_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -433,6 +459,23 @@ fn run() -> Result<()> {
                 idempotency_key,
             )?;
             println!("Pulse recorded at {observed_at}");
+        }
+        Command::Decide {
+            chose,
+            over,
+            dampen,
+            reason,
+            decided_at,
+        } => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            rt.ingest(WorldEvent::DecisionRecorded {
+                chose: chose.clone(),
+                over,
+                dampen,
+                reason,
+                decided_at,
+            })?;
+            println!("Decision recorded: chose {chose}");
         }
     }
     Ok(())
