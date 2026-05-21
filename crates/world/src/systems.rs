@@ -2,15 +2,62 @@ use bevy_ecs::prelude::*;
 
 use crate::explanation::{Cause, ChangeLog, ChangeRecord};
 use crate::model::{
-    canonical_tag, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now, Project,
-    ProjectStatus, Signal, Unprocessed,
+    canonical_tag, DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now,
+    PendingDecision, Project, ProjectStatus, Signal, Unprocessed,
 };
 
 pub fn register_systems(schedule: &mut Schedule) {
-    // Matching runs first so freshly-arrived signals update LastTouched
-    // before decay reads it. Decay therefore sees `days_elapsed = 0` for
-    // any project just touched, leaving the match's effect intact.
-    schedule.add_systems((signal_project_matching_system, project_decay_system).chain());
+    // decision_application runs first so any subsequent matching /
+    // decay step in this same per-event tick sees the stance the user
+    // just declared (issues #4/#5 will lean on this ordering for the
+    // boost and dampening multipliers). Matching runs before decay so
+    // freshly-arrived signals update LastTouched before decay reads
+    // it; decay then sees `days_elapsed = 0` for any project just
+    // touched, leaving the match's effect intact.
+    schedule.add_systems(
+        (
+            decision_application_system,
+            signal_project_matching_system,
+            project_decay_system,
+        )
+            .chain(),
+    );
+}
+
+/// Apply a queued [`PendingDecision`] to every targeted Project's
+/// stance, then despawn the marker.
+///
+/// ADR-0008 `#per-project-stance-derived-by-replay`: "most-recent
+/// Decision wins per project" by replay order. Bevy's
+/// `commands.entity(...).insert(component)` *replaces* an existing
+/// component of the same type, so this implementation naturally
+/// supersedes the prior stance on each targeted Project.
+///
+/// `over` is intentionally **not** part of `PendingDecision`. Per
+/// ADR-0008 it is narrative-only and has no mechanical effect; the
+/// `decision list` command (issue #7) reconstructs it from the
+/// originating event in the log by `decision_id`.
+pub fn decision_application_system(
+    mut commands: Commands,
+    pending: Query<(Entity, &PendingDecision)>,
+    projects: Query<(Entity, &Identity), With<Project>>,
+) {
+    for (pending_entity, decision) in &pending {
+        for (proj_entity, ident) in &projects {
+            if ident.0 == decision.chose {
+                commands.entity(proj_entity).insert(DecisionStance::Chosen {
+                    decision_id: decision.decision_id.clone(),
+                });
+            } else if decision.dampen.iter().any(|id| id == &ident.0) {
+                commands
+                    .entity(proj_entity)
+                    .insert(DecisionStance::Dampened {
+                        decision_id: decision.decision_id.clone(),
+                    });
+            }
+        }
+        commands.entity(pending_entity).despawn();
+    }
 }
 
 /// For each unprocessed signal:

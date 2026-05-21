@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use liferuntime_agent_bridge::{AgentBridge, FakeAgent, ProposedEvent, SignalAnalysisInput};
 use liferuntime_world::{
-    Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView, WorldChanges, WorldEvent,
-    WorldRuntime,
+    DecisionStance, Explanation, ProjectStatus, ProjectTrajectoryView, ProjectView, WorldChanges,
+    WorldEvent, WorldRuntime,
 };
 use std::path::{Path, PathBuf};
 
@@ -101,6 +101,20 @@ enum Command {
         #[arg(long = "decided-at")]
         decided_at: Option<DateTime<Utc>>,
     },
+
+    /// Decision queries (per-project stance, future polish in issue #7).
+    #[command(subcommand)]
+    Decision(DecisionCmd),
+}
+
+#[derive(Subcommand)]
+enum DecisionCmd {
+    /// Print active per-project Decision stances.
+    ///
+    /// Minimal format in this slice (issue #2). The full block format
+    /// with boost remaining, decided-on date, and partial supersession
+    /// lands in issue #7.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -477,8 +491,29 @@ fn run() -> Result<()> {
             })?;
             println!("Decision recorded: chose {chose}");
         }
+        Command::Decision(DecisionCmd::List) => {
+            let mut rt = WorldRuntime::open_dir(&cli.dir)?;
+            let stances = rt.decision_stances();
+            print_decision_stances(&stances);
+        }
     }
     Ok(())
+}
+
+fn print_decision_stances(stances: &std::collections::HashMap<String, DecisionStance>) {
+    if stances.is_empty() {
+        println!("No active decisions.");
+        return;
+    }
+    let mut rows: Vec<(&String, &DecisionStance)> = stances.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    for (project_id, stance) in rows {
+        let (verb, decision_id) = match stance {
+            DecisionStance::Chosen { decision_id } => ("chosen", decision_id),
+            DecisionStance::Dampened { decision_id } => ("dampened", decision_id),
+        };
+        println!("{project_id}: {verb} by {decision_id}");
+    }
 }
 
 fn cmd_init(dir: &Path) -> Result<()> {
