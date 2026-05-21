@@ -2,21 +2,25 @@ use bevy_ecs::prelude::*;
 
 use crate::explanation::{Cause, ChangeLog, ChangeRecord};
 use crate::model::{
-    canonical_tag, DecisionStance, Goal, GoalStatus, Identity, LastTouched, LatestEventId, Now,
-    PendingDecision, Project, ProjectStatus, Signal, Unprocessed,
+    canonical_tag, DecisionBoost, DecisionStance, Goal, GoalStatus, Identity, LastTouched,
+    LatestEventId, Now, PendingDecision, Project, ProjectStatus, Signal, Unprocessed,
 };
 
 pub fn register_systems(schedule: &mut Schedule) {
     // decision_application runs first so any subsequent matching /
     // decay step in this same per-event tick sees the stance the user
-    // just declared (issues #4/#5 will lean on this ordering for the
-    // boost and dampening multipliers). Matching runs before decay so
-    // freshly-arrived signals update LastTouched before decay reads
-    // it; decay then sees `days_elapsed = 0` for any project just
-    // touched, leaving the match's effect intact.
+    // just declared (issues #4/#5 lean on this ordering for the boost
+    // and dampening multipliers). decision_boost_decay runs next so a
+    // TimePulse erodes the additive boost layer before matching reads
+    // the project's visible relevance for downstream views. Matching
+    // runs before project_decay so freshly-arrived signals update
+    // LastTouched before decay reads it; decay then sees
+    // `days_elapsed = 0` for any project just touched, leaving the
+    // match's effect intact.
     schedule.add_systems(
         (
             decision_application_system,
+            decision_boost_decay_system,
             signal_project_matching_system,
             project_decay_system,
         )
@@ -39,24 +43,117 @@ pub fn register_systems(schedule: &mut Schedule) {
 /// originating event in the log by `decision_id`.
 pub fn decision_application_system(
     mut commands: Commands,
+    now: Res<Now>,
     pending: Query<(Entity, &PendingDecision)>,
-    projects: Query<(Entity, &Identity), With<Project>>,
+    projects: Query<(Entity, &Identity, &Project, Option<&DecisionBoost>)>,
+    mut change_log: ResMut<ChangeLog>,
 ) {
     for (pending_entity, decision) in &pending {
-        for (proj_entity, ident) in &projects {
+        for (proj_entity, ident, project, current_boost) in &projects {
             if ident.0 == decision.chose {
+                // Issue #4: apply (or replace) the decaying boost.
+                // Boost is `+0.15` initially and decays toward zero;
+                // boosts do NOT stack — a later Chosen for the same
+                // project resets the timer (#6 covers the transition
+                // matrix in detail).
+                let prior_contribution = current_boost.map(|b| b.remaining).unwrap_or(0.0);
+                let visible_before =
+                    (project.strategic_relevance + prior_contribution).clamp(0.0, 1.0);
+                let visible_after =
+                    (project.strategic_relevance + DecisionBoost::INITIAL).clamp(0.0, 1.0);
+
                 commands.entity(proj_entity).insert(DecisionStance::Chosen {
                     decision_id: decision.decision_id.clone(),
                 });
+                commands.entity(proj_entity).insert(DecisionBoost {
+                    decision_id: decision.decision_id.clone(),
+                    remaining: DecisionBoost::INITIAL,
+                    last_decay_at: now.at(),
+                });
+
+                if (visible_after - visible_before).abs() >= 1e-6 {
+                    change_log.records.push(ChangeRecord {
+                        triggered_by_event: decision.decision_id.clone(),
+                        entity_id: ident.0.clone(),
+                        field: "strategic_relevance".into(),
+                        before: visible_before,
+                        after: visible_after,
+                        causes: vec![Cause::DecisionBoostApplied {
+                            decision_id: decision.decision_id.clone(),
+                            contribution: DecisionBoost::INITIAL,
+                        }],
+                    });
+                }
             } else if decision.dampen.iter().any(|id| id == &ident.0) {
                 commands
                     .entity(proj_entity)
                     .insert(DecisionStance::Dampened {
                         decision_id: decision.decision_id.clone(),
                     });
+                // A Dampened project doesn't carry a boost. If a prior
+                // Chosen Decision was steering it, drop the boost
+                // component so visible falls back to raw.
+                if current_boost.is_some() {
+                    commands.entity(proj_entity).remove::<DecisionBoost>();
+                }
             }
         }
         commands.entity(pending_entity).despawn();
+    }
+}
+
+/// Erode each Project's `DecisionBoost` by `0.999 ^ days_elapsed` per
+/// per-event tick (ADR-0008 `#chosen-decaying-boost-not-a-floor`).
+///
+/// Emits a `ChangeRecord` whose `before`/`after` capture the **visible**
+/// strategic_relevance movement (raw + boost), citing
+/// `Cause::DecisionBoostApplied` with the contribution remaining
+/// after this tick. Raw is never touched.
+pub fn decision_boost_decay_system(
+    now: Res<Now>,
+    latest_event: Res<LatestEventId>,
+    mut boosted: Query<(&Identity, &Project, &mut DecisionBoost)>,
+    mut change_log: ResMut<ChangeLog>,
+) {
+    const SECS_PER_DAY: f32 = 86_400.0;
+
+    let Some(triggering_id) = latest_event.get().cloned() else {
+        return; // empty log → no time has passed
+    };
+
+    for (ident, project, mut boost) in &mut boosted {
+        let elapsed_secs = (now.at() - boost.last_decay_at).num_seconds().max(0) as f32;
+        let days = elapsed_secs / SECS_PER_DAY;
+        if days <= 0.0 {
+            continue;
+        }
+
+        let new_remaining = boost.remaining * DecisionBoost::DECAY_PER_DAY.powf(days);
+        let visible_before = (project.strategic_relevance + boost.remaining).clamp(0.0, 1.0);
+        let visible_after = (project.strategic_relevance + new_remaining).clamp(0.0, 1.0);
+
+        boost.remaining = new_remaining;
+        boost.last_decay_at = now.at();
+
+        // Skip emitting if the visible movement is negligible — e.g.
+        // a sub-second per-event tick on an already-tiny boost. The
+        // boost component still updates so the next non-trivial tick
+        // computes from the correct baseline.
+        if (visible_after - visible_before).abs() < 1e-4 {
+            continue;
+        }
+
+        change_log.records.push(ChangeRecord {
+            triggered_by_event: triggering_id.clone(),
+            entity_id: ident.0.clone(),
+            field: "strategic_relevance".into(),
+            before: visible_before,
+            after: visible_after,
+            causes: vec![Cause::DecisionBoostApplied {
+                decision_id: boost.decision_id.clone(),
+                contribution: new_remaining,
+            }],
+        });
     }
 }
 

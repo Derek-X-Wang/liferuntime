@@ -44,6 +44,16 @@ pub enum Cause {
         importance: f32,
         factor: f32,
     },
+    /// A `Chosen` Decision contributed an additive boost to the
+    /// project's *visible* `strategic_relevance` (ADR-0008
+    /// `#chosen-decaying-boost-not-a-floor`). `contribution` is the
+    /// boost magnitude in effect for this record (the size of the
+    /// additive layer right now); it shrinks per event-log day until
+    /// the Decision is superseded or revoked.
+    DecisionBoostApplied {
+        decision_id: EventId,
+        contribution: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +136,13 @@ fn render_cause(c: &Cause) -> String {
         } => format!(
             "Goal \"{}\" (importance {:.2}) amplified by ×{:.2}",
             goal_name, importance, factor,
+        ),
+        Cause::DecisionBoostApplied {
+            decision_id,
+            contribution,
+        } => format!(
+            "Decision {} contributed boost +{:.3} on visible strategic_relevance",
+            decision_id, contribution,
         ),
     }
 }

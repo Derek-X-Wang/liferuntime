@@ -568,7 +568,10 @@ fn print_project(p: &ProjectView) {
     };
     println!("Project: {} ({}) [{}]", p.name, p.id, status_label);
     println!("Tags: [{}]", p.tags.join(", "));
-    println!("  strategic_relevance: {:.2}", p.strategic_relevance);
+    println!(
+        "  strategic_relevance: raw {:.2}  visible {:.2}",
+        p.strategic_relevance_raw, p.strategic_relevance_visible,
+    );
     println!("  urgency:             {:.2}", p.urgency);
 }
 

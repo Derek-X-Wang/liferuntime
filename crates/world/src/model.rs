@@ -205,6 +205,38 @@ pub struct PendingDecision {
     pub dampen: Vec<String>,
 }
 
+/// Decaying boost on visible `strategic_relevance` attached to a
+/// Project entity for the duration of a `Chosen` Decision stance
+/// (ADR-0008 `#chosen-decaying-boost-not-a-floor`).
+///
+/// Stored separately from `Project.strategic_relevance` so the raw
+/// value the matching/decay systems see is **never** touched by a
+/// Decision. The boost is an additive layer surfaced through
+/// `ProjectView::strategic_relevance_visible`.
+///
+/// `last_decay_at` tracks the event-log time at which the boost was
+/// last advanced, so the `decision_boost_decay_system` can apply
+/// `0.999^days_elapsed` per per-event tick without compounding from
+/// the initial bump.
+///
+/// Removed when:
+/// - The owning Decision is revoked (issue #3).
+/// - A later Decision flips the project's stance to `Dampened` or
+///   away from `Chosen` (issue #6 covers the full transition matrix).
+#[derive(Component, Clone, Debug)]
+pub struct DecisionBoost {
+    pub decision_id: EventId,
+    pub remaining: f32,
+    pub last_decay_at: DateTime<Utc>,
+}
+
+impl DecisionBoost {
+    /// Initial boost magnitude on `Chosen` (ADR-0008).
+    pub const INITIAL: f32 = 0.15;
+    /// Per-event-log-day decay factor (ADR-0008).
+    pub const DECAY_PER_DAY: f32 = 0.999;
+}
+
 /// Set of decision_ids that have been observed in `DecisionRecorded`
 /// events during the lifetime of this runtime. Rebuilt by replay from
 /// the event log.
