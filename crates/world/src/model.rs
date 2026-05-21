@@ -18,6 +18,12 @@ pub struct Project {
     pub archived_reason: Option<String>,
     #[serde(default)]
     pub completion_note: Option<String>,
+    /// Light declarative annotation: "this project needs these others to
+    /// make sense." Surfaced in `inspect` only — **no system effects**
+    /// in v1 (CONTEXT.md `#depends_on`). Cycles are permitted (rendered
+    /// flat); ingest rejects unknown ids.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 impl Project {
@@ -30,6 +36,7 @@ impl Project {
             status: ProjectStatus::Active,
             archived_reason: None,
             completion_note: None,
+            depends_on: Vec::new(),
         }
     }
 }

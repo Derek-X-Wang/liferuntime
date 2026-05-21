@@ -18,12 +18,18 @@ pub enum WorldEvent {
     },
     /// Patch an existing project. Only fields with `Some(_)` are updated.
     /// `tags`, if provided, *replaces* the project's tag list.
+    /// `depends_on`, if provided, *replaces* the project's dependency
+    /// list (CONTEXT.md `#depends_on`); `Some(empty)` clears the list,
+    /// `None` leaves it untouched. Old logs without the field
+    /// deserialize as `None` (additive variant, ADR-0005).
     ProjectUpdated {
         id: String,
         #[serde(default)]
         name: Option<String>,
         #[serde(default)]
         tags: Option<Vec<String>>,
+        #[serde(default)]
+        depends_on: Option<Vec<String>>,
     },
     GoalCreated {
         id: String,

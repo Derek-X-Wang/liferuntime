@@ -236,12 +236,26 @@ impl WorldRuntime {
                 }
                 check_unit("importance", *importance)?;
             }
-            WorldEvent::ProjectUpdated { id, .. } => {
+            WorldEvent::ProjectUpdated { id, depends_on, .. } => {
                 if !self.project_exists(id) {
                     return Err(RuntimeError::EntityNotFound {
                         kind: "Project",
                         id: id.clone(),
                     });
+                }
+                // CONTEXT.md `#depends_on`: every referenced id must
+                // resolve to an existing Project. Cycles are permitted
+                // (the list is a declarative annotation, not a
+                // traversable graph), so no graph validation here.
+                if let Some(deps) = depends_on {
+                    for dep_id in deps {
+                        if !self.project_exists(dep_id) {
+                            return Err(RuntimeError::EntityNotFound {
+                                kind: "Project",
+                                id: dep_id.clone(),
+                            });
+                        }
+                    }
                 }
             }
             WorldEvent::GoalUpdated { id, importance, .. } => {
@@ -550,6 +564,7 @@ impl WorldRuntime {
                     status: project.status,
                     archived_reason: project.archived_reason.clone(),
                     completion_note: project.completion_note.clone(),
+                    depends_on: project.depends_on.clone(),
                 });
             }
         }
@@ -711,7 +726,12 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                 },
             ));
         }
-        WorldEvent::ProjectUpdated { id, name, tags } => {
+        WorldEvent::ProjectUpdated {
+            id,
+            name,
+            tags,
+            depends_on,
+        } => {
             let mut q = world.query::<(&Identity, &mut Project)>();
             for (ident, mut project) in q.iter_mut(world) {
                 if ident.0 == *id {
@@ -720,6 +740,13 @@ fn apply_event(world: &mut World, stored: &StoredEvent<WorldEvent>) {
                     }
                     if let Some(t) = tags {
                         project.tags = t.clone();
+                    }
+                    // `Some(_)` is full-replace (mirrors `tags`); `None`
+                    // leaves the field untouched. `Some(empty)` clears
+                    // the list — the only path to an empty annotation
+                    // after a prior non-empty update.
+                    if let Some(d) = depends_on {
+                        project.depends_on = d.clone();
                     }
                     break;
                 }
@@ -1098,6 +1125,7 @@ mod tests {
                     id: "tnt".into(),
                     name: Some("TNT (voice agent)".into()),
                     tags: Some(vec!["ai".into(), "voice".into()]),
+                    depends_on: None,
                 },
                 t0 + Duration::minutes(5),
             )
@@ -1352,6 +1380,7 @@ mod tests {
             id: "nope".into(),
             name: Some("Whatever".into()),
             tags: None,
+            depends_on: None,
         });
         assert!(
             matches!(
@@ -3331,6 +3360,367 @@ mod tests {
         assert_eq!(
             rendered, expected,
             "rendered output mismatched spec:\n--- got:\n{rendered}\n--- expected:\n{expected}",
+        );
+    }
+
+    // -------- Project: depends_on annotation (issue #15) --------
+    //
+    // Per `docs/CONTEXT.md` `#depends_on` and ADR-0005 (additive variant
+    // contract): `Project.depends_on` is a light declarative annotation
+    // surfaced in `inspect` only — **no system effects**. Cycles are
+    // permitted (rendered flat); unknown project ids are rejected at
+    // ingest.
+
+    #[test]
+    fn newly_created_project_has_empty_depends_on() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        let view = rt.inspect_project("tnt").expect("project exists");
+        assert!(
+            view.depends_on.is_empty(),
+            "expected empty depends_on by default, got {:?}",
+            view.depends_on,
+        );
+    }
+
+    #[test]
+    fn project_update_sets_depends_on_list() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "tnt".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["side-x".into()]),
+        })
+        .unwrap();
+        let view = rt.inspect_project("tnt").expect("project exists");
+        assert_eq!(view.depends_on, vec!["side-x".to_string()]);
+    }
+
+    #[test]
+    fn project_update_with_none_depends_on_leaves_field_untouched() {
+        // Symmetric with `tags` semantics: `None` ⇒ untouched, `Some(_)`
+        // ⇒ full replace.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("tnt", &["ai"])).unwrap();
+        rt.ingest(project("side-x", &["voice"])).unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "tnt".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["side-x".into()]),
+        })
+        .unwrap();
+        // Now patch the name only — depends_on must persist.
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "tnt".into(),
+            name: Some("TNT (voice)".into()),
+            tags: None,
+            depends_on: None,
+        })
+        .unwrap();
+        let view = rt.inspect_project("tnt").expect("project exists");
+        assert_eq!(view.name, "TNT (voice)");
+        assert_eq!(
+            view.depends_on,
+            vec!["side-x".to_string()],
+            "depends_on must be untouched when ProjectUpdated.depends_on is None"
+        );
+    }
+
+    #[test]
+    fn project_update_replaces_depends_on_list() {
+        // Some(list) is full-replace semantics, mirroring `tags`.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &[])).unwrap();
+        rt.ingest(project("b", &[])).unwrap();
+        rt.ingest(project("c", &[])).unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["b".into()]),
+        })
+        .unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["c".into()]),
+        })
+        .unwrap();
+        let view = rt.inspect_project("a").expect("project exists");
+        assert_eq!(
+            view.depends_on,
+            vec!["c".to_string()],
+            "the second update should fully replace the first list",
+        );
+    }
+
+    #[test]
+    fn project_update_clears_depends_on_to_empty() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &[])).unwrap();
+        rt.ingest(project("b", &[])).unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["b".into()]),
+        })
+        .unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec![]),
+        })
+        .unwrap();
+        let view = rt.inspect_project("a").expect("project exists");
+        assert!(
+            view.depends_on.is_empty(),
+            "Some(empty) should clear the list, got {:?}",
+            view.depends_on
+        );
+    }
+
+    #[test]
+    fn project_update_rejects_unknown_depends_on_id() {
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &[])).unwrap();
+        let initial_count = rt.event_count();
+        let result = rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["ghost".into()]),
+        });
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::EntityNotFound {
+                    kind: "Project",
+                    ..
+                })
+            ),
+            "expected EntityNotFound for unknown depends_on id, got {result:?}"
+        );
+        assert_eq!(
+            rt.event_count(),
+            initial_count,
+            "rejected event must not be appended to the log",
+        );
+    }
+
+    #[test]
+    fn project_depends_on_allows_cycles() {
+        // Per CONTEXT.md `#depends_on`, cycles are permitted: the list is
+        // a declarative annotation, not a traversable graph. Validation
+        // only checks that ids exist.
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &[])).unwrap();
+        rt.ingest(project("b", &[])).unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["b".into()]),
+        })
+        .unwrap();
+        // The reverse edge — would form a 2-cycle. Must be accepted.
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "b".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["a".into()]),
+        })
+        .unwrap();
+        let a = rt.inspect_project("a").expect("project a exists");
+        let b = rt.inspect_project("b").expect("project b exists");
+        assert_eq!(a.depends_on, vec!["b".to_string()]);
+        assert_eq!(b.depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn project_depends_on_change_emits_no_change_records() {
+        // Property pin: `ProjectUpdated{ depends_on: Some(_) }` must not
+        // produce any ChangeRecord — `depends_on` is observed by no
+        // system in v1. (resonance / decay / decision-boost are
+        // unaffected because they read other fields entirely.)
+        let mut rt = WorldRuntime::in_memory().unwrap();
+        rt.ingest(project("a", &["ai"])).unwrap();
+        rt.ingest(project("b", &["voice"])).unwrap();
+        // Drain the cursor so any pre-existing records don't bleed in.
+        let _ = rt.advance().unwrap();
+        rt.ingest(WorldEvent::ProjectUpdated {
+            id: "a".into(),
+            name: None,
+            tags: None,
+            depends_on: Some(vec!["b".into()]),
+        })
+        .unwrap();
+        let changes = rt.advance().unwrap();
+        assert!(
+            changes.is_empty(),
+            "depends_on update must produce no ChangeRecords, got {:?}",
+            changes.records,
+        );
+    }
+
+    #[test]
+    fn project_depends_on_does_not_perturb_resonance_or_decay() {
+        // Stronger version of the above: run an identical event sequence
+        // in two runtimes — one with a depends_on update spliced in,
+        // one without — and confirm the resonance + decay ChangeRecords
+        // come out byte-equivalent on every field that matters.
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let mut baseline = WorldRuntime::in_memory().unwrap();
+        baseline
+            .ingest_at(project("a", &["ai", "voice"]), t0)
+            .unwrap();
+        baseline.ingest_at(project("b", &["voice"]), t0).unwrap();
+        baseline
+            .ingest_at(
+                signal("voice progress", &["voice"], 0.7),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        baseline
+            .ingest_at(
+                WorldEvent::TimePulseObserved {
+                    observed_at: t0 + Duration::days(7),
+                },
+                t0 + Duration::days(7),
+            )
+            .unwrap();
+        let base_changes = baseline.advance().unwrap();
+
+        let mut with_dep = WorldRuntime::in_memory().unwrap();
+        with_dep
+            .ingest_at(project("a", &["ai", "voice"]), t0)
+            .unwrap();
+        with_dep.ingest_at(project("b", &["voice"]), t0).unwrap();
+        // Splice in the depends_on update *between* projects and the
+        // signal. occurred_at matches the signal's predecessor so Now
+        // doesn't advance (no decay perturbation from the extra event).
+        with_dep
+            .ingest_at(
+                WorldEvent::ProjectUpdated {
+                    id: "a".into(),
+                    name: None,
+                    tags: None,
+                    depends_on: Some(vec!["b".into()]),
+                },
+                t0,
+            )
+            .unwrap();
+        with_dep
+            .ingest_at(
+                signal("voice progress", &["voice"], 0.7),
+                t0 + Duration::minutes(1),
+            )
+            .unwrap();
+        with_dep
+            .ingest_at(
+                WorldEvent::TimePulseObserved {
+                    observed_at: t0 + Duration::days(7),
+                },
+                t0 + Duration::days(7),
+            )
+            .unwrap();
+        let with_changes = with_dep.advance().unwrap();
+
+        assert_eq!(
+            base_changes.records.len(),
+            with_changes.records.len(),
+            "record counts differ:\nbase: {:?}\nwith: {:?}",
+            base_changes.records,
+            with_changes.records,
+        );
+        for (x, y) in base_changes.records.iter().zip(with_changes.records.iter()) {
+            assert_eq!(x.entity_id, y.entity_id, "entity_id drift");
+            assert_eq!(x.field, y.field, "field drift");
+            assert!(
+                (x.before - y.before).abs() < 1e-6,
+                "before drift: {} vs {}",
+                x.before,
+                y.before,
+            );
+            assert!(
+                (x.after - y.after).abs() < 1e-6,
+                "after drift: {} vs {}",
+                x.after,
+                y.after,
+            );
+        }
+        // And the depends_on annotation should be present on `a` after
+        // replay, untouched by matching/decay.
+        let a = with_dep.inspect_project("a").unwrap();
+        assert_eq!(a.depends_on, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn project_depends_on_persists_through_open_dir_replay() {
+        // JSONL round-trip: write a depends_on update, re-open, confirm
+        // the field survives replay. Also confirms the event-log layer
+        // serializes / deserializes the new optional payload field.
+        let dir = tempfile_dir();
+        {
+            let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+            rt.ingest(project("a", &["ai"])).unwrap();
+            rt.ingest(project("b", &["voice"])).unwrap();
+            rt.ingest(WorldEvent::ProjectUpdated {
+                id: "a".into(),
+                name: None,
+                tags: None,
+                depends_on: Some(vec!["b".into()]),
+            })
+            .unwrap();
+        }
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let a = rt.inspect_project("a").expect("project a persisted");
+        assert_eq!(a.depends_on, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn project_depends_on_legacy_jsonl_without_field_loads_cleanly() {
+        // Backward-compat (ADR-0005 option-B): a hand-written
+        // ProjectUpdated row that omits `depends_on` entirely must
+        // deserialize as if `depends_on: None` were present.
+        use std::io::Write as _;
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let events_path = dir.join("events.jsonl");
+        // Two ProjectCreated rows + one ProjectUpdated row missing the
+        // new field. These ids are ULIDs by length; the runtime tolerates
+        // hand-written ids on read (the EventId ordering uses string
+        // compare and ULIDs are lexicographically sortable, but for the
+        // purposes of this test we only check that load doesn't panic).
+        // Lines are written via `write_all` to avoid clippy's
+        // `write_literal` lint on `writeln!("{}", literal)`.
+        let mut f = std::fs::File::create(&events_path).unwrap();
+        let rows = [
+            r#"{"id":"01AAAAAAAAAAAAAAAAAAAAAAAA","occurred_at":"2026-01-01T00:00:00Z","payload":{"kind":"ProjectCreated","id":"a","name":"A","tags":["ai"]}}"#,
+            r#"{"id":"01AAAAAAAAAAAAAAAAAAAAAAAB","occurred_at":"2026-01-01T00:00:01Z","payload":{"kind":"ProjectCreated","id":"b","name":"B","tags":["voice"]}}"#,
+            // No `depends_on` field on this update — additive variant test.
+            r#"{"id":"01AAAAAAAAAAAAAAAAAAAAAAAC","occurred_at":"2026-01-01T00:00:02Z","payload":{"kind":"ProjectUpdated","id":"a","name":"A renamed"}}"#,
+        ];
+        for row in rows {
+            f.write_all(row.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        drop(f);
+
+        let mut rt = WorldRuntime::open_dir(&dir).unwrap();
+        let a = rt.inspect_project("a").expect("project a persisted");
+        assert_eq!(a.name, "A renamed");
+        assert!(
+            a.depends_on.is_empty(),
+            "old log entry without depends_on must deserialize as empty, got {:?}",
+            a.depends_on
         );
     }
 }
