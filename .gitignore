@@ -3,3 +3,6 @@ Cargo.lock.bak
 .liferuntime/
 *.swp
 .DS_Store
+
+# cmux-team worktree isolation
+.claude/worktrees/
