@@ -171,6 +171,10 @@ See `docs/LANGUAGE.md` for the architecture vocabulary
     scheduling (vs batch advance)
   - [ADR-0007](docs/adr/0007-dir-level-flock-for-concurrent-cli.md) —
     Dir-level flock for concurrent CLI access
+  - [ADR-0008](docs/adr/0008-decision-as-first-class.md) — Decision as
+    a first-class entity (decaying boost, dampening, per-project stance)
+  - [ADR-0009](docs/adr/0009-factual-world-boundary.md) — Factual World
+    boundary (copy-in, deferred build, dogfood-gated trigger)
 
 ---
 

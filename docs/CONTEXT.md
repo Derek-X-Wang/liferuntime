@@ -3,6 +3,43 @@
 The shared domain vocabulary of LifeRuntime. Every public name in the
 codebase should map back to one of these concepts.
 
+## Purpose
+
+LifeRuntime is an explainable attention-allocation runtime for a
+many-project life: it turns recorded signals, goals, and decisions into
+causal shifts in project relevance, so you can choose where your
+judgment should focus next.
+
+This is the test for every feature: does it help surface *where
+attention is being pulled* and *why*? If a proposed feature instead
+tracks *how work gets done* — task boards, subtasks, assignments,
+percent-complete, workflow automation — it does not belong here.
+LifeRuntime is execution-*aware*, not execution-*software*: an
+execution fact may enter only as a Signal that shifts attention ("this
+shipped", "this account needs review"); it never becomes a managed
+to-do.
+
+The system surfaces; it does not decide. It is a strategic mirror, not
+an oracle — it reports what is pulling on attention and lets human
+judgment choose. The scarce resource is the human's judgment; the
+runtime's job is to point it at the right project at the right time.
+
+### Deterministic core, probabilistic shell
+
+The trust foundation under everything above. The world is deterministic
+and replayable: the same events always produce the same state, and every
+state value traces back to recorded Events via Causes (this is what
+makes the relevance ranking trustworthy rather than a black box).
+
+Probabilistic components — LLMs and other AI providers — live *outside*
+the core, at the [AgentBridge](#agentbridge) seam. They may *propose*
+Events; they never mutate world state directly. Accepted proposals are
+written to the log as ordinary inputs, and replay never re-runs the AI.
+So the world stays reproducible even though the AI that helped populate
+it is not. AI assists; AI does not own reality. See
+`docs/adr/0001-cli-first-local-runtime.md` and the README's "Why it
+exists".
+
 ## World
 
 The persistent simulated state representing the user's life, projects,
@@ -104,11 +141,36 @@ An external or internal event that may affect strategy — market news,
 personal updates, project progress, or financial changes. Signals are
 ingested as Events.
 
+## AgentBridge
+
+The seam between the deterministic core and probabilistic AI providers.
+An AgentBridge adapter *proposes* Events (e.g. turning a paragraph of
+free text into candidate Signals); it never mutates world state and
+never reaches inside the runtime. The runtime decides whether to ingest
+each proposal, and only ingested proposals become Events in the log.
+
+This is the boundary that keeps the world reproducible despite
+non-reproducible AI (see [Purpose: Deterministic core, probabilistic
+shell](#deterministic-core-probabilistic-shell)). v1 ships one adapter,
+the keyword-based `FakeAgent` stub, surfaced via `liferuntime signal
+analyze`. Real LLM adapters are deferred until a second adapter
+justifies widening the trait.
+
 ## Factual World
 
 The shared external world of public events and facts (AI news, market
 moves, political events). A Factual World may provide Signals to a
 Personal World. **Not built in v1.**
+
+When built, a Factual World is **a source of proposed Signals, not a
+second runtime kind**: accepted facts are *copied into* the Personal
+World's own event log as ordinary `SignalObserved` inputs carrying
+provenance (source name, upstream id/hash, observed time). A Personal
+World always replays from its own log alone — it never references an
+upstream Factual log at replay time, so the deterministic-core
+guarantee survives subscription. See
+`docs/adr/0009-factual-world-boundary.md` for the boundary invariants
+and the dogfood-gated build trigger.
 
 ## Personal World
 
