@@ -24,6 +24,25 @@ an oracle — it reports what is pulling on attention and lets human
 judgment choose. The scarce resource is the human's judgment; the
 runtime's job is to point it at the right project at the right time.
 
+### Non-goals
+
+Things LifeRuntime deliberately does not do, however natural they might
+look next to what it does do:
+
+- **Task boards, subtasks, assignments** — execution management belongs
+  in execution tools.
+- **Percent-complete / progress dashboards** — progress may arrive as a
+  Signal ("shipped v1"); it is never a managed field.
+- **Workflow automation** — the runtime never acts on the world; it
+  mirrors it.
+- **Calendars, scheduling, reminders** — time enters only as event-log
+  time; the runtime holds no appointments.
+- **Prescriptive recommendations ("do X next")** — it surfaces what is
+  pulling on attention and why; the human decides.
+
+A feature request that lands in this list is answered by pointing here,
+not by building a "small version" of it.
+
 ### Deterministic core, probabilistic shell
 
 The trust foundation under everything above. The world is deterministic
@@ -207,6 +226,28 @@ Decision graph or cascading decay may layer on top later, but the
 annotation alone does not change relevance, urgency, or recommendations.
 Cycles are permitted (rendered flat); references to unknown project ids
 are rejected at ingest.
+
+### ProjectKind
+
+Two kinds of Project, distinguished by what silence means:
+
+- **Growth** — exists to *move forward* (ship TNT, finish the research).
+  Silence is decline: no signals for weeks means real cooling, and the
+  current Decay semantics (drift toward baseline, ↓ trajectory) model it
+  correctly.
+- **Maintenance** — exists to *stay healthy* (family health, bank
+  account, budget). Silence is stable: no news is good news. Decay
+  toward baseline mislabels a quiet maintenance project as "cooling" —
+  a false alarm. The interesting signal for a Maintenance project is
+  *anomaly* ("account needs review"), not absence.
+
+*Not yet implemented; the terms are reserved.* All v1 projects behave as
+Growth (uniform decay). Whether Maintenance projects need different
+decay, different trajectory arrows, or anomaly-only surfacing is
+deliberately undecided — dogfooding should name which false alarms
+actually hurt before mechanics are designed. Use these terms when
+reporting that pain ("family-health is showing the Maintenance
+false-cooling problem").
 
 ### ProjectStatus
 
